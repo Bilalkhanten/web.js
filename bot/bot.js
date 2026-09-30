@@ -264,6 +264,9 @@ const FREQ_LABEL = {
 };
 // ---- Daily tools: headlines, weather, prayer times, morning brief (free public services) ----
 const loadSettings = () => readJson(SETTINGS, {});
+// While paused the bot stays running but only answers !resume (plus !stop / !restart).
+const isPaused = () => Boolean(loadSettings().paused?.on);
+const PAUSED_TEXT = '⏸ The bot is paused. Send !resume to turn it back on.';
 const saveSettings = (v) =>
     fs.writeFileSync(SETTINGS, JSON.stringify(v, null, 2));
 
@@ -1237,6 +1240,7 @@ async function handleFlowVote(chat, f, choice) {
 }
 
 async function handleVote(vote) {
+    if (isPaused()) return;
     const pollId = vote.parentMessage?.id?._serialized;
     if (!vote.selectedOptions.length) return;
     const choice = vote.selectedOptions[0].name;
@@ -1279,15 +1283,32 @@ const HELP = [
     '!spent 12 lunch - log an expense',
     "!today - today's expenses and total",
     '!menu - show a tap-to-choose menu (poll) in this chat',
+    '!pause / !resume - make the bot quiet / active again',
     '!stop - stop the bot (start it again from your laptop)',
     '!restart - restart the bot',
     '!help - this list',
 ].join('\n');
 
+async function resume(chat) {
+    saveSettings({ ...loadSettings(), paused: { on: false } });
+    return send(
+        chat,
+        '▶️ Resumed. Reminders that came due while paused are sent now (if less than 15 minutes late).',
+    );
+}
+
 async function handle(msg) {
     const body = (msg.body || '').trim();
     if (body.startsWith(MARK)) return; // the bot's own message
     const chat = msg.fromMe ? msg.to : msg.from;
+    if (isPaused()) {
+        const first = body.split(/\s+/)[0].toLowerCase();
+        if (first === '!resume') return resume(chat);
+        if (first !== '!stop' && first !== '!restart') {
+            if (body.startsWith('!')) await send(chat, PAUSED_TEXT);
+            return;
+        }
+    }
     if (!body.startsWith('!')) {
         await handleFlowAnswer(chat, body);
         return;
@@ -1443,6 +1464,18 @@ async function handle(msg) {
                 `☀️ Morning brief is on: every day at ${to12h(brief.time)}.`,
             );
         }
+        case '!pause': {
+            if (!(await isSelfChat(chat)))
+                return say(
+                    'Pause only works in your own "Message yourself" chat.',
+                );
+            saveSettings({ ...loadSettings(), paused: { on: true, chat } });
+            return say(
+                "⏸ Paused. I'll stay quiet until you send !resume. Reminders and scheduled messages wait; anything more than 15 minutes late when you resume is skipped.",
+            );
+        }
+        case '!resume':
+            return say('The bot is not paused.');
         case '!stop':
         case '!restart': {
             if (!(await isSelfChat(chat)))
@@ -1579,12 +1612,18 @@ client.on('disconnected', (r) => console.log('DISCONNECTED', r));
 client.on('ready', () => {
     clearTimeout(stuckTimer);
     console.log('READY, logged in as', client.info.wid.user);
+    const paused = loadSettings().paused;
+    if (paused?.on && paused.chat)
+        send(paused.chat, PAUSED_TEXT).catch((e) =>
+            console.log('pause notice failed:', e.message),
+        );
     // If the hidden browser dies (e.g. Windows is shutting down), exit so start-bot.bat restarts us.
     client.pupBrowser?.on('disconnected', () => {
         console.log('Browser closed, exiting so the bot restarts');
         process.exit(1);
     });
     setInterval(() => {
+        if (isPaused()) return; // reminders wait until !resume
         fireDue().catch((e) => console.log('fireDue error', e.message));
         checkBirthdays().catch((e) =>
             console.log('birthday check error', e.message),
