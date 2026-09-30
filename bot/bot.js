@@ -12,6 +12,7 @@
  *   BOT_DATA_DIR    Where login session, reminders and expenses are stored (default ./data)
  */
 const fs = require('fs');
+const { execFileSync } = require('child_process');
 const path = require('path');
 const qrcode = require('qrcode-terminal');
 const { Client, LocalAuth, Poll } = require('../index');
@@ -528,7 +529,42 @@ async function handle(msg) {
     }
 }
 
+// Give up and let start-bot.bat restart us if we are not ready 5 minutes after starting
+// (unless a QR scan is needed, which takes as long as you need).
+const START_TIMEOUT_MS = 5 * 60000;
+const stuckTimer = setTimeout(() => {
+    console.log('Not ready after 5 minutes, exiting so the bot restarts');
+    process.exit(1);
+}, START_TIMEOUT_MS);
+
+// A browser left over from a previous run can hold the saved login and break the next start.
+function killStaleBrowsers() {
+    if (process.platform !== 'win32') return;
+    const script =
+        'Get-CimInstance Win32_Process -Filter "Name=\'chrome.exe\'" | ' +
+        'Where-Object { $_.CommandLine -and $_.CommandLine.Contains($env:BOT_AUTH) } | ' +
+        'ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }';
+    try {
+        execFileSync(
+            'powershell',
+            ['-NoProfile', '-NonInteractive', '-Command', script],
+            {
+                env: { ...process.env, BOT_AUTH: path.join(DATA, 'auth') },
+                timeout: 20000,
+                stdio: 'ignore',
+            },
+        );
+    } catch (e) {
+        console.log('could not clean up old browsers:', e.message);
+    }
+}
+
+client.on('loading_screen', (percent, msg) =>
+    console.log('LOADING', percent, msg),
+);
+client.on('change_state', (state) => console.log('STATE', state));
 client.on('qr', (qr) => {
+    clearTimeout(stuckTimer);
     console.log('Scan this QR with WhatsApp > Linked devices > Link a device:');
     qrcode.generate(qr, { small: true });
 });
@@ -536,6 +572,7 @@ client.on('authenticated', () => console.log('AUTHENTICATED'));
 client.on('auth_failure', (m) => console.log('AUTH FAILURE', m));
 client.on('disconnected', (r) => console.log('DISCONNECTED', r));
 client.on('ready', () => {
+    clearTimeout(stuckTimer);
     console.log('READY, logged in as', client.info.wid.user);
     // If the hidden browser dies (e.g. Windows is shutting down), exit so start-bot.bat restarts us.
     client.pupBrowser?.on('disconnected', () => {
@@ -563,6 +600,8 @@ process.on('unhandledRejection', (e) =>
     console.log('UNHANDLED', (e && e.stack) || e),
 );
 
+killStaleBrowsers();
+console.log('starting browser...');
 client.initialize().catch((e) => {
     console.error('INIT ERROR', e.message);
     process.exit(1);
