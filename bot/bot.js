@@ -537,6 +537,11 @@ client.on('auth_failure', (m) => console.log('AUTH FAILURE', m));
 client.on('disconnected', (r) => console.log('DISCONNECTED', r));
 client.on('ready', () => {
     console.log('READY, logged in as', client.info.wid.user);
+    // If the hidden browser dies (e.g. Windows is shutting down), exit so start-bot.bat restarts us.
+    client.pupBrowser?.on('disconnected', () => {
+        console.log('Browser closed, exiting so the bot restarts');
+        process.exit(1);
+    });
     setInterval(
         () => fireDue().catch((e) => console.log('fireDue error', e.message)),
         10000,

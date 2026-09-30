@@ -1,10 +1,13 @@
 @echo off
-rem Starts the WhatsApp bot. Put a shortcut to this file in the Windows Startup
-rem folder (Win+R, type shell:startup) to launch it whenever you log in.
+rem Starts the WhatsApp bot and restarts it whenever it stops.
+rem Launch it at login via Task Scheduler or a shortcut in the Startup folder
+rem (Win+R, type shell:startup). Output and timestamps go to data\bot.log.
 cd /d "%~dp0"
 if not exist data mkdir data
 :loop
+echo [%date% %time%] starting bot >> data\bot.log
 node bot.js >> data\bot.log 2>&1
-rem If the bot exits (crash, network problem), wait 10 seconds and start it again.
-timeout /t 10 /nobreak >nul
+echo [%date% %time%] bot stopped (exit code %errorlevel%), restarting in 10 seconds >> data\bot.log
+rem "timeout" fails when there is no console (hidden/scheduled runs); ping waits reliably.
+ping -n 11 127.0.0.1 >nul
 goto loop
