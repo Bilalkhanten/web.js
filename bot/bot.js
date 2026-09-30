@@ -29,6 +29,7 @@ const SHOPPING = path.join(DATA, 'shopping.json');
 const BIRTHDAYS = path.join(DATA, 'birthdays.json');
 const TEMPLATES = path.join(DATA, 'templates.json');
 const STATE = path.join(DATA, 'state.json');
+const SETTINGS = path.join(DATA, 'settings.json');
 const STALE_MS = 15 * 60000; // never send messages that are more than this late
 
 const client = new Client({
@@ -226,6 +227,7 @@ const MENU = [
     ['🛒 Shopping list', 'shop'],
     ['🎂 Birthdays', 'birthdays'],
     ['📰 News & markets', 'news'],
+    ['🧰 Daily tools', 'tools'],
     ['📋 My reminders', 'reminders'],
 ];
 const menuPolls = new Map(); // poll message id -> chat it was sent in
@@ -260,6 +262,262 @@ const FREQ_LABEL = {
     weekdays: 'every weekday',
     weekly: 'every week',
 };
+// ---- Daily tools: headlines, weather, prayer times, morning brief (free public services) ----
+const loadSettings = () => readJson(SETTINGS, {});
+const saveSettings = (v) =>
+    fs.writeFileSync(SETTINGS, JSON.stringify(v, null, 2));
+
+async function getText(url) {
+    let lastError;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+            const res = await fetch(url, {
+                signal: AbortSignal.timeout(12000),
+                headers: {
+                    'User-Agent':
+                        'Mozilla/5.0 (compatible; personal-whatsapp-bot)',
+                },
+            });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            return await res.text();
+        } catch (e) {
+            lastError = e;
+            console.log(
+                'fetch failed (attempt ' + attempt + '):',
+                url.slice(0, 60),
+                e.message,
+            );
+            if (attempt < 2) await new Promise((r) => setTimeout(r, 1500));
+        }
+    }
+    throw lastError;
+}
+const getJson = async (url) => JSON.parse(await getText(url));
+
+/** Looks a city up; returns { name, country, lat, lon, tz } or null when not found. */
+async function geocode(name) {
+    const d = await getJson(
+        `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(name)}&count=1&language=en`,
+    );
+    const r = d.results && d.results[0];
+    return r
+        ? {
+              name: r.name,
+              country: r.country || '',
+              lat: r.latitude,
+              lon: r.longitude,
+              tz: r.timezone,
+          }
+        : null;
+}
+
+const cityLabel = (c) => (c.country ? `${c.name}, ${c.country}` : c.name);
+
+function weatherWords(code) {
+    if (code === 0) return 'Clear sky';
+    if (code <= 2) return code === 1 ? 'Mainly clear' : 'Partly cloudy';
+    if (code === 3) return 'Overcast';
+    if (code === 45 || code === 48) return 'Fog';
+    if (code >= 51 && code <= 57) return 'Drizzle';
+    if (code >= 61 && code <= 67) return 'Rain';
+    if (code >= 71 && code <= 77) return 'Snow';
+    if (code >= 80 && code <= 82) return 'Rain showers';
+    if (code === 85 || code === 86) return 'Snow showers';
+    if (code >= 95) return 'Thunderstorm';
+    return 'Unsettled';
+}
+
+async function weatherText(city) {
+    const d = await getJson(
+        `https://api.open-meteo.com/v1/forecast?latitude=${city.lat}&longitude=${city.lon}` +
+            '&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m' +
+            '&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max' +
+            '&timezone=auto&forecast_days=1',
+    );
+    const c = d.current;
+    const day = d.daily;
+    return (
+        `🌤 Weather - ${cityLabel(city)}\n` +
+        `Now: ${Math.round(c.temperature_2m)}°C (feels ${Math.round(c.apparent_temperature)}°C), ${weatherWords(c.weather_code)}, wind ${Math.round(c.wind_speed_10m)} km/h\n` +
+        `Today: ${Math.round(day.temperature_2m_min[0])}–${Math.round(day.temperature_2m_max[0])}°C, rain chance ${day.precipitation_probability_max[0] ?? 0}%`
+    );
+}
+
+const to12h = (hhmm) => {
+    const [h, m] = hhmm.split(':').map(Number);
+    return `${h % 12 || 12}:${String(m).padStart(2, '0')} ${h < 12 ? 'am' : 'pm'}`;
+};
+
+async function prayerText(city) {
+    const tz = city.tz || 'UTC';
+    const date = new Date()
+        .toLocaleDateString('en-GB', { timeZone: tz })
+        .split('/')
+        .join('-');
+    const school = loadSettings().school;
+    const d = await getJson(
+        `https://api.aladhan.com/v1/timings/${date}?latitude=${city.lat}&longitude=${city.lon}` +
+            `&timezonestring=${encodeURIComponent(tz)}` +
+            (school ? `&school=${school === 'hanafi' ? 1 : 0}` : ''),
+    );
+    const t = d.data.timings;
+    const names = ['Fajr', 'Sunrise', 'Dhuhr', 'Asr', 'Maghrib', 'Isha'];
+    const nowParts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: tz,
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+    })
+        .format(new Date())
+        .split(':')
+        .map(Number);
+    const nowMin = (nowParts[0] % 24) * 60 + nowParts[1];
+    const minutes = (n) => {
+        const [h, m] = t[n].split(':').map(Number);
+        return h * 60 + m;
+    };
+    const next = names.find((n) => minutes(n) > nowMin);
+    const meta = d.data.meta || {};
+    return (
+        `🕌 Prayer times - ${cityLabel(city)} (${date.replace(/-/g, '/')})\n` +
+        names.map((n) => `${n}: ${to12h(t[n])}`).join('\n') +
+        `\nNext: ${next ? `${next} at ${to12h(t[next])}` : 'Fajr tomorrow'}` +
+        `\n(${meta.method ? meta.method.name : 'auto method'}${school ? ', Asr: ' + school : ''})`
+    );
+}
+
+const FEEDS = {
+    '🌍 World': [
+        ['BBC News', 'https://feeds.bbci.co.uk/news/world/rss.xml'],
+        ['Al Jazeera', 'https://www.aljazeera.com/xml/rss/all.xml'],
+    ],
+    '🤖 AI': [
+        [
+            'MIT Technology Review',
+            'https://www.technologyreview.com/topic/artificial-intelligence/feed',
+        ],
+        ['Ars Technica', 'https://arstechnica.com/ai/feed/'],
+    ],
+    '💼 Business & markets': [
+        ['BBC Business', 'https://feeds.bbci.co.uk/news/business/rss.xml'],
+    ],
+};
+const FEED_WORDS = {
+    world: '🌍 World',
+    ai: '🤖 AI',
+    business: '💼 Business & markets',
+};
+
+const decodeXml = (x) =>
+    x
+        .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+        .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;|&#039;/g, "'")
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&amp;/g, '&')
+        .trim();
+
+function parseRss(xml, n) {
+    const tag = (item, name) => {
+        const m = new RegExp(`<${name}[^>]*>([\\s\\S]*?)</${name}>`).exec(item);
+        return m ? decodeXml(m[1]) : '';
+    };
+    return [...xml.matchAll(/<item[\s>][\s\S]*?<\/item>/g)]
+        .map((m) => ({ title: tag(m[0], 'title'), link: tag(m[0], 'link') }))
+        .filter((i) => i.title && i.link)
+        .slice(0, n);
+}
+
+async function headlinesText(cat, n = 5) {
+    for (const [source, url] of FEEDS[cat]) {
+        try {
+            const items = parseRss(await getText(url), n);
+            if (items.length)
+                return (
+                    `${cat} headlines - ${source}\n` +
+                    items
+                        .map((i, k) => `${k + 1}. ${i.title}\n${i.link}`)
+                        .join('\n')
+                );
+        } catch (e) {
+            console.log('feed failed:', source, e.message);
+        }
+    }
+    return `⚠️ Could not load ${cat} headlines right now. Try again in a minute.`;
+}
+
+const needCity = 'Set your city first: !city Karachi';
+
+function expensesOn(date) {
+    let txt = '';
+    try {
+        txt = fs.readFileSync(EXPENSES, 'utf8');
+    } catch {
+        /* no expenses yet */
+    }
+    return txt
+        .split('\n')
+        .filter((l) => l.startsWith(date + ','))
+        .reduce((sum, l) => sum + (Number(l.split(',')[1]) || 0), 0);
+}
+
+async function briefText(chat) {
+    const n = localNow();
+    const parts = [`☀️ Good morning! ${n.toUTCString().slice(0, 16)}`];
+    const city = loadSettings().city;
+    parts.push(
+        city
+            ? await weatherText(city).catch(
+                  () => '🌤 (weather unavailable right now)',
+              )
+            : '🌤 Add your city for weather: !city Karachi',
+    );
+    const dayStart =
+        Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate()) -
+        TZ_OFFSET_MIN * 60000;
+    const todays = load()
+        .filter(
+            (r) =>
+                r.chat === chat &&
+                r.due >= dayStart &&
+                r.due < dayStart + 86400000,
+        )
+        .sort((a, b) => a.due - b.due);
+    parts.push(
+        todays.length
+            ? '📋 Today:\n' +
+                  todays
+                      .map(
+                          (r) =>
+                              `• ${fmt(r.due).slice(11)} ${r.repeat ? '🔁 ' : ''}${r.to ? '→ ' + r.toName + ': ' : ''}${r.text}`,
+                      )
+                      .join('\n')
+            : '📋 Nothing scheduled today.',
+    );
+    const y = new Date(n.getTime() - 86400000).toISOString().slice(0, 10);
+    const spent = expensesOn(y);
+    if (spent) parts.push(`💸 Yesterday you spent: ${spent}`);
+    parts.push(await headlinesText('🌍 World', 3));
+    return parts.join('\n\n');
+}
+
+// Sends the morning brief once a day, at the chosen time (skipped if the bot was off for 3+ hours).
+async function checkBrief() {
+    const b = loadSettings().brief;
+    if (!b || !b.on) return;
+    const n = localNow();
+    const [h, m] = b.time.split(':').map(Number);
+    const since = n.getUTCHours() * 60 + n.getUTCMinutes() - (h * 60 + m);
+    if (since < 0 || since > 180) return;
+    const st = readJson(STATE, {});
+    if (st.brief === today()) return;
+    st.brief = today();
+    fs.writeFileSync(STATE, JSON.stringify(st));
+    await send(b.chat, await briefText(b.chat));
+}
+
 // Links sent by the "News & markets" option. Edit this list to change the sources.
 const NEWS = {
     '📈 Stocks': [
@@ -615,6 +873,106 @@ const STEP = {
             return 'ok';
         },
     },
+    toolPick: {
+        acts: {
+            '📰 Top headlines': 'headlines',
+            '🌤 Weather': 'weather',
+            '🕌 Prayer times': 'prayer',
+            '☀️ Morning brief': 'brief',
+        },
+        poll() {
+            return {
+                title: 'Daily tools',
+                options: [...Object.keys(this.acts), CANCEL_OPT],
+            };
+        },
+        prompt: () => 'Tap an option',
+        tap(f, c) {
+            if (!this.acts[c]) return 'ignore';
+            f.data.next = this.acts[c];
+            return 'ok';
+        },
+    },
+    newsCat: {
+        poll: () => ({
+            title: 'Headlines from…',
+            options: [...Object.keys(FEEDS), CANCEL_OPT],
+        }),
+        prompt: () => 'Tap an option',
+        tap(f, c) {
+            if (!FEEDS[c]) return 'ignore';
+            f.data.cat = c;
+            return 'ok';
+        },
+    },
+    city: {
+        prompt: () =>
+            '✍️ Which city? (used for weather and prayer times) For example: Karachi\n(send "cancel" to stop)',
+        async typed(f, t) {
+            let c;
+            try {
+                c = await geocode(t);
+            } catch {
+                return 'I could not reach the city lookup service. Try again in a minute.';
+            }
+            if (!c)
+                return `I couldn't find "${t}". Try just the city name, like Karachi.`;
+            saveSettings({ ...loadSettings(), city: c });
+            return null;
+        },
+    },
+    briefAction: {
+        acts: {
+            '✅ Turn on': 'on',
+            '⛔ Turn off': 'off',
+            '📤 Send it now': 'now',
+            '🕒 Change time': 'time',
+        },
+        poll() {
+            return {
+                title: 'Morning brief',
+                options: [...Object.keys(this.acts), CANCEL_OPT],
+            };
+        },
+        prompt: () => 'Tap an option',
+        tap(f, c) {
+            if (!this.acts[c]) return 'ignore';
+            f.data.action = this.acts[c];
+            return 'ok';
+        },
+    },
+    btime: {
+        times: {
+            '6:00 am': '06:00',
+            '7:00 am': '07:00',
+            '8:00 am': '08:00',
+            '9:00 am': '09:00',
+        },
+        poll() {
+            return {
+                title: 'Send the brief at…',
+                options: [...Object.keys(this.times), OTHER_TIME, CANCEL_OPT],
+            };
+        },
+        prompt: () => 'Type a time of day, like 7:30am or 06:45',
+        tap(f, c) {
+            if (c === OTHER_TIME) return 'retype';
+            if (!this.times[c]) return 'ignore';
+            f.data.time = this.times[c];
+            return 'ok';
+        },
+        typed(f, t) {
+            const m = /^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i.exec(t.trim());
+            let h = m ? Number(m[1]) : NaN;
+            const min = m ? Number(m[2] || 0) : NaN;
+            if (m && m[3])
+                h = (h % 12) + (m[3].toLowerCase() === 'pm' ? 12 : 0);
+            if (!(h >= 0 && h <= 23 && min >= 0 && min <= 59))
+                return "I couldn't read that time. Try 7:30am or 06:45.";
+            f.data.time = `${String(h).padStart(2, '0')}:${String(min).padStart(2, '0')}`;
+            return null;
+        },
+    },
     bAction: {
         acts: { '➕ Add birthday': 'add', '📅 Upcoming': 'upcoming' },
         poll() {
@@ -705,6 +1063,49 @@ const FLOWS = {
             return shopText(list);
         },
     },
+    tools: {
+        steps: () => ['toolPick'],
+        done: (chat, d) => ({ startFlow: d.next }),
+    },
+    headlines: {
+        steps: () => ['newsCat'],
+        done: (chat, d) => headlinesText(d.cat),
+    },
+    weather: {
+        steps: () => (loadSettings().city ? [] : ['city']),
+        done: () =>
+            weatherText(loadSettings().city).catch(
+                () =>
+                    '⚠️ Could not load the weather right now. Try again in a minute.',
+            ),
+    },
+    prayer: {
+        steps: () => (loadSettings().city ? [] : ['city']),
+        done: () =>
+            prayerText(loadSettings().city).catch(
+                () =>
+                    '⚠️ Could not load prayer times right now. Try again in a minute.',
+            ),
+    },
+    brief: {
+        steps: (d) =>
+            d.action === 'time' ? ['briefAction', 'btime'] : ['briefAction'],
+        async done(chat, d) {
+            const st = loadSettings();
+            const brief = { on: true, time: '07:00', ...st.brief, chat };
+            const cityNote = st.city
+                ? ''
+                : '\n(Add your city for weather: !city Karachi)';
+            if (d.action === 'now') return briefText(chat);
+            if (d.action === 'off') {
+                saveSettings({ ...st, brief: { ...brief, on: false } });
+                return '⛔ Morning brief is off.';
+            }
+            if (d.action === 'time') brief.time = d.time;
+            saveSettings({ ...st, brief });
+            return `☀️ Morning brief is on: every day at ${to12h(brief.time)}.${cityNote}`;
+        },
+    },
     news: {
         steps: () => ['newsPick'],
         done: (chat, d) => newsText(d.pick),
@@ -755,6 +1156,7 @@ async function startFlow(chat, kind) {
     }
     const f = { kind, step: 0, data: {}, expires: Date.now() + FLOW_MS };
     flows.set(chat, f);
+    if (!stepsOf(f).length) return finish(chat, f); // nothing to ask
     return askStep(chat, f);
 }
 
@@ -770,8 +1172,21 @@ async function advance(chat, f) {
     f.pollId = null;
     f.expires = Date.now() + FLOW_MS;
     if (f.step < stepsOf(f).length) return askStep(chat, f);
+    return finish(chat, f);
+}
+
+// All questions answered: run the flow's action, then show the menu again.
+async function finish(chat, f) {
     flows.delete(chat);
-    await send(chat, FLOWS[f.kind].done(chat, f.data));
+    let out;
+    try {
+        out = await FLOWS[f.kind].done(chat, f.data);
+    } catch (e) {
+        console.log('flow error', e.message);
+        out = '⚠️ Something went wrong: ' + e.message;
+    }
+    if (out && out.startFlow) return startFlow(chat, out.startFlow);
+    await send(chat, out);
     return sendMenu(chat);
 }
 
@@ -790,7 +1205,7 @@ async function handleFlowAnswer(chat, body) {
     const def = curDef(f);
     let error = null;
     if (def.typed) {
-        error = def.typed(f, body);
+        error = await def.typed(f, body);
     } else {
         // Poll-only step: accept the option's text typed out.
         const opt = ((def.poll && def.poll(f)) || { options: [] }).options.find(
@@ -856,6 +1271,11 @@ const HELP = [
     '!template add Good night - add a quick message for the menu',
     '!templates - list quick messages',
     '!news - links to stocks, world news and AI news',
+    '!city Karachi - set your city (weather, prayer times, morning brief)',
+    '!weather - weather for your city',
+    '!prayer - prayer times (!prayer hanafi / !prayer standard sets the Asr method)',
+    '!headlines world|ai|business - top headlines',
+    '!brief on|off|now - daily morning brief (!brief time 7:30am)',
     '!spent 12 lunch - log an expense',
     "!today - today's expenses and total",
     '!menu - show a tap-to-choose menu (poll) in this chat',
@@ -956,6 +1376,69 @@ async function handle(msg) {
             fs.writeFileSync(CONTACTS, JSON.stringify(c, null, 2));
             return say(
                 `✅ Saved group ${m[1].toLowerCase()} -> ${hits[0].name}`,
+            );
+        }
+        case '!city': {
+            if (!arg) {
+                const c = loadSettings().city;
+                return say(c ? `Your city is ${cityLabel(c)}.` : needCity);
+            }
+            let c;
+            try {
+                c = await geocode(arg);
+            } catch {
+                return say(
+                    'I could not reach the city lookup service. Try again in a minute.',
+                );
+            }
+            if (!c)
+                return say(`I couldn't find "${arg}". Try just the city name.`);
+            saveSettings({ ...loadSettings(), city: c });
+            return say(`✅ City set to ${cityLabel(c)}.`);
+        }
+        case '!weather': {
+            const c = loadSettings().city;
+            if (!c) return say(needCity);
+            return say(
+                await weatherText(c).catch(
+                    () => '⚠️ Could not load the weather right now.',
+                ),
+            );
+        }
+        case '!prayer': {
+            const c = loadSettings().city;
+            if (!c) return say(needCity);
+            if (/^(hanafi|standard)$/i.test(arg))
+                saveSettings({ ...loadSettings(), school: arg.toLowerCase() });
+            return say(
+                await prayerText(c).catch(
+                    () => '⚠️ Could not load prayer times right now.',
+                ),
+            );
+        }
+        case '!headlines': {
+            const cat = FEED_WORDS[arg.toLowerCase()] || FEED_WORDS.world;
+            return say(await headlinesText(cat));
+        }
+        case '!brief': {
+            const [what, ...more] = arg.toLowerCase().split(/\s+/);
+            const st = loadSettings();
+            const brief = { on: true, time: '07:00', ...st.brief, chat };
+            if (what === 'now') return say(await briefText(chat));
+            if (what === 'off') {
+                saveSettings({ ...st, brief: { ...brief, on: false } });
+                return say('⛔ Morning brief is off.');
+            }
+            if (what === 'time') {
+                const f = { data: {} };
+                const err = STEP.btime.typed(f, more.join(' '));
+                if (err) return say(err);
+                brief.time = f.data.time;
+            } else if (what !== 'on')
+                return say('Usage: !brief on | off | now | time 7:30am');
+            saveSettings({ ...st, brief });
+            return say(
+                `☀️ Morning brief is on: every day at ${to12h(brief.time)}.`,
             );
         }
         case '!news':
@@ -1088,6 +1571,7 @@ client.on('ready', () => {
         checkBirthdays().catch((e) =>
             console.log('birthday check error', e.message),
         );
+        checkBrief().catch((e) => console.log('brief error', e.message));
     }, 10000);
     // Health check: if WhatsApp's page stops answering or is not connected for
     // 3 minutes in a row, exit so start-bot.bat restarts the bot.
