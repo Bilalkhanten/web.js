@@ -583,12 +583,38 @@ client.on('ready', () => {
         () => fireDue().catch((e) => console.log('fireDue error', e.message)),
         10000,
     );
+    // Health check: if WhatsApp's page stops answering or is not connected for
+    // 3 minutes in a row, exit so start-bot.bat restarts the bot.
+    let bad = 0;
+    setInterval(async () => {
+        try {
+            const state = await client.getState();
+            bad = state === 'CONNECTED' ? 0 : bad + 1;
+            if (bad) console.log('health check: state is', state);
+        } catch (e) {
+            bad++;
+            console.log('health check failed:', e.message);
+        }
+        if (bad >= 3) {
+            console.log('Unhealthy for 3 checks, exiting so the bot restarts');
+            process.exit(1);
+        }
+    }, 60000);
 });
 client.on('vote_update', (vote) => {
     handleVote(vote).catch((e) => console.log('vote error', e.message));
 });
 // Only obey messages sent from YOUR OWN account; ignore everyone else.
 client.on('message_create', (msg) => {
+    // Log that a message was seen (text only for commands) to help diagnose "no reply" problems.
+    const body = msg.body || '';
+    console.log(
+        'MSG seen, fromMe:',
+        msg.fromMe,
+        'type:',
+        msg.type,
+        body.startsWith('!') ? 'cmd: ' + body.slice(0, 30) : '',
+    );
     if (msg.fromMe)
         handle(msg).catch((e) => console.log('handler error', e.message));
 });
