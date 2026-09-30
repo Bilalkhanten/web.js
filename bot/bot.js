@@ -225,6 +225,7 @@ const MENU = [
     ['👥 Message a group', 'group'],
     ['🛒 Shopping list', 'shop'],
     ['🎂 Birthdays', 'birthdays'],
+    ['📰 News & markets', 'news'],
     ['📋 My reminders', 'reminders'],
 ];
 const menuPolls = new Map(); // poll message id -> chat it was sent in
@@ -259,6 +260,36 @@ const FREQ_LABEL = {
     weekdays: 'every weekday',
     weekly: 'every week',
 };
+// Links sent by the "News & markets" option. Edit this list to change the sources.
+const NEWS = {
+    '📈 Stocks': [
+        ['Yahoo Finance', 'https://finance.yahoo.com/'],
+        ['Google Finance', 'https://www.google.com/finance/'],
+        [
+            'TradingView - most active US stocks',
+            'https://www.tradingview.com/markets/stocks-usa/market-movers-active/',
+        ],
+    ],
+    '🌍 World news': [
+        ['BBC News - World', 'https://www.bbc.com/news/world'],
+        ['Al Jazeera', 'https://www.aljazeera.com/news/'],
+        ['DW - Top stories', 'https://www.dw.com/en/top-stories/s-9097'],
+    ],
+    '🤖 AI news': [
+        [
+            'MIT Technology Review - AI',
+            'https://www.technologyreview.com/topic/artificial-intelligence/',
+        ],
+        ['Ars Technica - AI', 'https://arstechnica.com/ai/'],
+        [
+            'The Verge - AI',
+            'https://www.theverge.com/ai-artificial-intelligence',
+        ],
+    ],
+};
+const newsText = (title) =>
+    `${title}\n` + NEWS[title].map(([n, u]) => `• ${n}\n${u}`).join('\n');
+
 const DEFAULT_TEMPLATES = [
     'Good morning ❤️',
     'On my way',
@@ -572,6 +603,18 @@ const STEP = {
             return 'ok';
         },
     },
+    newsPick: {
+        poll: () => ({
+            title: 'News & markets',
+            options: [...Object.keys(NEWS), CANCEL_OPT],
+        }),
+        prompt: () => 'Tap an option',
+        tap(f, c) {
+            if (!NEWS[c]) return 'ignore';
+            f.data.pick = c;
+            return 'ok';
+        },
+    },
     bAction: {
         acts: { '➕ Add birthday': 'add', '📅 Upcoming': 'upcoming' },
         poll() {
@@ -661,6 +704,10 @@ const FLOWS = {
             }
             return shopText(list);
         },
+    },
+    news: {
+        steps: () => ['newsPick'],
+        done: (chat, d) => newsText(d.pick),
     },
     birthdays: {
         steps: (d) =>
@@ -808,6 +855,7 @@ const HELP = [
     '!groups - list saved groups',
     '!template add Good night - add a quick message for the menu',
     '!templates - list quick messages',
+    '!news - links to stocks, world news and AI news',
     '!spent 12 lunch - log an expense',
     "!today - today's expenses and total",
     '!menu - show a tap-to-choose menu (poll) in this chat',
@@ -910,6 +958,8 @@ async function handle(msg) {
                 `✅ Saved group ${m[1].toLowerCase()} -> ${hits[0].name}`,
             );
         }
+        case '!news':
+            return say(Object.keys(NEWS).map(newsText).join('\n\n'));
         case '!groups': {
             const g = contactNames(true);
             return say(
