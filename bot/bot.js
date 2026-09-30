@@ -14,7 +14,7 @@
 const fs = require('fs');
 const path = require('path');
 const qrcode = require('qrcode-terminal');
-const { Client, LocalAuth } = require('../index');
+const { Client, LocalAuth, Poll } = require('../index');
 
 const TZ_OFFSET_MIN = Number(process.env.TZ_OFFSET_MIN ?? 300);
 const DATA = path.resolve(
@@ -89,6 +89,7 @@ function parseTimeTokens(toks) {
     const off = (toks[0] || '').toLowerCase() === 'tomorrow' ? 1 : 0;
     const base = toks.slice(off);
     for (const n of [2, 1]) {
+        if (base.length < n) continue; // not enough words left for an n-word time
         const when = parseWhen(base.slice(0, n).join(' '), off);
         if (when) return { when, used: off + n };
     }
@@ -121,7 +122,7 @@ async function fireDue() {
     for (const r of due) {
         // A stale message (bot was offline) is reported to you instead of sent late.
         if (now - r.due > STALE_MS) {
-            await client.sendMessage(
+            await send(
                 r.chat,
                 `⚠️ Missed (bot was offline) - NOT sent${r.to ? ' to ' + r.toName : ''}: ${r.text}`,
             );
@@ -130,22 +131,202 @@ async function fireDue() {
         if (r.to) {
             try {
                 await client.sendMessage(r.to, r.text);
-                await client.sendMessage(
-                    r.chat,
-                    `✅ Sent to ${r.toName}: ${r.text}`,
-                );
+                await send(r.chat, `✅ Sent to ${r.toName}: ${r.text}`);
                 console.log('sent scheduled message to', r.toName);
             } catch (e) {
-                await client.sendMessage(
+                await send(
                     r.chat,
                     `❌ Could not send to ${r.toName}: ${e.message}`,
                 );
             }
         } else {
-            await client.sendMessage(r.chat, '⏰ Reminder: ' + r.text);
+            await send(r.chat, '⏰ Reminder: ' + r.text);
             console.log('fired reminder', r.text);
         }
     }
+}
+
+// Every message the bot sends to you starts with an invisible marker, so it can
+// tell its own messages apart from your answers (both come from your account).
+const MARK = '​';
+const send = (chat, content) =>
+    client.sendMessage(
+        chat,
+        typeof content === 'string' ? MARK + content : content,
+    );
+
+function addReminder(chat, when, text) {
+    const all = load();
+    all.push({ due: when, text, chat });
+    save(all);
+    return `✅ Okay, I'll remind you at ${fmt(when)}: ${text}`;
+}
+
+function addScheduled(chat, when, name, text) {
+    const id = loadContacts()[name];
+    if (!id)
+        return `Unknown contact "${name}". Add it first: !contact add ${name} 923001234567`;
+    const all = load();
+    all.push({ due: when, text, chat, to: id, toName: name });
+    save(all);
+    return `✅ Scheduled for ${fmt(when)} to ${name}: ${text}\n(Use !reminders to review, !cancel <number> to undo)`;
+}
+
+function remindersText(chat) {
+    const mine = load()
+        .filter((r) => r.chat === chat)
+        .sort((a, b) => a.due - b.due);
+    return mine.length
+        ? mine
+              .map(
+                  (r, i) =>
+                      `${i + 1}. ${fmt(r.due)} ${r.to ? '→ ' + r.toName + ': ' : '- '}${r.text}`,
+              )
+              .join('\n')
+        : 'No pending reminders.';
+}
+
+function todayText() {
+    const e = expensesToday();
+    return e.length
+        ? e.map((x) => `• ${x.amt} ${x.note}`).join('\n') +
+              `\nTotal: ${e.reduce((s, x) => s + x.amt, 0)}`
+        : 'No expenses logged today.';
+}
+
+// ---- Poll menu (!menu) and the step-by-step questions it starts ----
+const MENU = [
+    ['⏰ Remind me', 'remind'],
+    ['📨 Schedule a message', 'schedule'],
+    ['📋 My reminders', 'reminders'],
+    ["💸 Today's expenses", 'today'],
+    ['❓ Help', 'help'],
+];
+const menuPolls = new Map(); // poll message id -> chat it was sent in
+const flows = new Map(); // chat -> { kind, step, data, expires }
+const FLOW_MS = 10 * 60000;
+const FLOW_STEPS = {
+    remind: ['time', 'text'],
+    schedule: ['who', 'time', 'text'],
+};
+
+// The menu is only offered in your own "Message yourself" chat, so nobody else can vote on it.
+async function isSelfChat(chat) {
+    try {
+        if ((await client.getContactById(chat)).isMe) return true;
+    } catch {
+        /* fall through to the id check */
+    }
+    return chat.split('@')[0] === client.info.wid.user;
+}
+
+async function sendMenu(chat) {
+    const poll = await client.sendMessage(
+        chat,
+        new Poll(
+            MARK + 'What do you want to do?',
+            MENU.map((m) => m[0]),
+        ),
+    );
+    menuPolls.set(poll.id._serialized, chat);
+}
+
+function prompt(f) {
+    switch (FLOW_STEPS[f.kind][f.step]) {
+        case 'who': {
+            const names = Object.keys(loadContacts()).join(', ');
+            return `Who should get the message? Saved: ${names}\n(send "cancel" to stop)`;
+        }
+        case 'time':
+            return 'When? For example: 6pm, 18:30, in 10m, tomorrow 7am\n(send "cancel" to stop)';
+        default:
+            return f.kind === 'remind'
+                ? 'What should I remind you about?'
+                : `What message should I send to ${f.data.name}?`;
+    }
+}
+
+async function startFlow(chat, kind) {
+    if (kind === 'schedule' && !Object.keys(loadContacts()).length) {
+        await send(
+            chat,
+            'No saved contacts yet. Save one first: !contact add wife 923001234567',
+        );
+        return sendMenu(chat);
+    }
+    const f = { kind, step: 0, data: {}, expires: Date.now() + FLOW_MS };
+    flows.set(chat, f);
+    return send(chat, prompt(f));
+}
+
+// Returns true if the text was an answer to a pending question.
+async function handleFlowAnswer(chat, body) {
+    const f = flows.get(chat);
+    if (!f || !body) return false;
+    if (Date.now() > f.expires) {
+        flows.delete(chat);
+        return false;
+    }
+    if (/^(cancel|stop)$/i.test(body)) {
+        flows.delete(chat);
+        await send(chat, 'Okay, cancelled.');
+        await sendMenu(chat);
+        return true;
+    }
+    const step = FLOW_STEPS[f.kind][f.step];
+    if (step === 'time') {
+        const toks = body.split(/\s+/);
+        const { when, used } = parseTimeTokens(toks);
+        if (!when || used !== toks.length) {
+            await send(
+                chat,
+                "I couldn't read that time. Try 6pm, 18:30, in 10m or tomorrow 7am.",
+            );
+            return true;
+        }
+        f.data.when = when;
+    } else if (step === 'who') {
+        const name = body.toLowerCase();
+        if (!loadContacts()[name]) {
+            await send(
+                chat,
+                `I don't know "${body}". Saved: ${Object.keys(loadContacts()).join(', ')}`,
+            );
+            return true;
+        }
+        f.data.name = name;
+    } else {
+        f.data.text = body;
+    }
+    f.step++;
+    f.expires = Date.now() + FLOW_MS;
+    if (f.step < FLOW_STEPS[f.kind].length) {
+        await send(chat, prompt(f));
+        return true;
+    }
+    flows.delete(chat);
+    await send(
+        chat,
+        f.kind === 'remind'
+            ? addReminder(chat, f.data.when, f.data.text)
+            : addScheduled(chat, f.data.when, f.data.name, f.data.text),
+    );
+    await sendMenu(chat);
+    return true;
+}
+
+async function handleVote(vote) {
+    const chat = menuPolls.get(vote.parentMessage?.id?._serialized);
+    if (!chat || !vote.selectedOptions.length) return;
+    const key = (MENU.find((m) => m[0] === vote.selectedOptions[0].name) ||
+        [])[1];
+    flows.delete(chat);
+    if (key === 'remind' || key === 'schedule') return startFlow(chat, key);
+    if (key === 'reminders') await send(chat, remindersText(chat));
+    else if (key === 'today') await send(chat, todayText());
+    else if (key === 'help') await send(chat, HELP);
+    else return;
+    return sendMenu(chat);
 }
 
 const HELP = [
@@ -159,22 +340,34 @@ const HELP = [
     '!schedule 7am wife Good morning  (also: tomorrow 7am, in 2h)',
     '!spent 12 lunch - log an expense',
     "!today - today's expenses and total",
+    '!menu - show a tap-to-choose menu (poll) in this chat',
     '!help - this list',
 ].join('\n');
 
 async function handle(msg) {
     const body = (msg.body || '').trim();
-    if (!body.startsWith('!')) return;
+    if (body.startsWith(MARK)) return; // the bot's own message
+    const chat = msg.fromMe ? msg.to : msg.from;
+    if (!body.startsWith('!')) {
+        await handleFlowAnswer(chat, body);
+        return;
+    }
+    flows.delete(chat); // typing a command abandons any pending question
     const [cmd, ...rest] = body.split(/\s+/);
     const arg = rest.join(' ');
-    const chat = msg.fromMe ? msg.to : msg.from;
-    const say = (t) => client.sendMessage(chat, t);
+    const say = (t) => send(chat, t);
 
     switch (cmd.toLowerCase()) {
         case '!ping':
             return say('pong');
         case '!help':
             return say(HELP);
+        case '!menu':
+            if (!(await isSelfChat(chat)))
+                return say(
+                    'The menu only works in your own "Message yourself" chat.',
+                );
+            return sendMenu(chat);
         case '!remind': {
             const toks = arg.split(/\s+/);
             const { when, used } = parseTimeTokens(toks);
@@ -183,10 +376,7 @@ async function handle(msg) {
                 return say(
                     'Usage: !remind 18:00 buy milk  |  !remind in 10m call mom',
                 );
-            const all = load();
-            all.push({ due: when, text, chat });
-            save(all);
-            return say(`✅ Okay, I'll remind you at ${fmt(when)}: ${text}`);
+            return say(addReminder(chat, when, text));
         }
         case '!contact': {
             const m = /^add\s+(\S+)\s+\+?(\d{8,15})$/i.exec(arg);
@@ -219,33 +409,10 @@ async function handle(msg) {
             const text = toks.slice(used + 1).join(' ');
             if (!when || !name || !text)
                 return say('Usage: !schedule 7am wife Good morning');
-            const id = loadContacts()[name];
-            if (!id)
-                return say(
-                    `Unknown contact "${name}". Add it first: !contact add ${name} 923001234567`,
-                );
-            const all = load();
-            all.push({ due: when, text, chat, to: id, toName: name });
-            save(all);
-            return say(
-                `✅ Scheduled for ${fmt(when)} to ${name}: ${text}\n(Use !reminders to review, !cancel <number> to undo)`,
-            );
+            return say(addScheduled(chat, when, name, text));
         }
-        case '!reminders': {
-            const mine = load()
-                .filter((r) => r.chat === chat)
-                .sort((a, b) => a.due - b.due);
-            return say(
-                mine.length
-                    ? mine
-                          .map(
-                              (r, i) =>
-                                  `${i + 1}. ${fmt(r.due)} ${r.to ? '→ ' + r.toName + ': ' : '- '}${r.text}`,
-                          )
-                          .join('\n')
-                    : 'No pending reminders.',
-            );
-        }
+        case '!reminders':
+            return say(remindersText(chat));
         case '!cancel': {
             const all = load();
             const mine = all
@@ -277,15 +444,8 @@ async function handle(msg) {
             const total = expensesToday().reduce((s, e) => s + e.amt, 0);
             return say(`💸 Logged ${m[1]} ${m[2]}\nToday's total: ${total}`);
         }
-        case '!today': {
-            const e = expensesToday();
-            return say(
-                e.length
-                    ? e.map((x) => `• ${x.amt} ${x.note}`).join('\n') +
-                          `\nTotal: ${e.reduce((s, x) => s + x.amt, 0)}`
-                    : 'No expenses logged today.',
-            );
-        }
+        case '!today':
+            return say(todayText());
         default:
             return say('Unknown command. Send !help');
     }
@@ -304,6 +464,9 @@ client.on('ready', () => {
         () => fireDue().catch((e) => console.log('fireDue error', e.message)),
         10000,
     );
+});
+client.on('vote_update', (vote) => {
+    handleVote(vote).catch((e) => console.log('vote error', e.message));
 });
 // Only obey messages sent from YOUR OWN account; ignore everyone else.
 client.on('message_create', (msg) => {
