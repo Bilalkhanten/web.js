@@ -1279,6 +1279,8 @@ const HELP = [
     '!spent 12 lunch - log an expense',
     "!today - today's expenses and total",
     '!menu - show a tap-to-choose menu (poll) in this chat',
+    '!stop - stop the bot (start it again from your laptop)',
+    '!restart - restart the bot',
     '!help - this list',
 ].join('\n');
 
@@ -1440,6 +1442,22 @@ async function handle(msg) {
             return say(
                 `☀️ Morning brief is on: every day at ${to12h(brief.time)}.`,
             );
+        }
+        case '!stop':
+        case '!restart': {
+            if (!(await isSelfChat(chat)))
+                return say(
+                    'Stop and restart only work in your own "Message yourself" chat.',
+                );
+            const stopping = cmd.toLowerCase() === '!stop';
+            await say(
+                stopping
+                    ? '🛑 Stopping the bot. To start it again, double-click start-now.bat on your laptop (or run: Start-ScheduledTask -TaskName "WhatsAppBot").'
+                    : '🔄 Restarting the bot. Back in about a minute.',
+            );
+            // Exit code 99 tells start-bot.bat not to restart; any other code restarts after 10 seconds.
+            setTimeout(() => process.exit(stopping ? 99 : 1), 2000);
+            return;
         }
         case '!news':
             return say(Object.keys(NEWS).map(newsText).join('\n\n'));

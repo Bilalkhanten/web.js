@@ -9,6 +9,7 @@ chat). Messages from anyone else are ignored.
 | `!menu`                                                          | Tap-to-choose poll: Remind me, Repeat reminder, Schedule a message, Quick message, Message a group, Shopping list, Birthdays, News & markets (links), Daily tools (headlines, weather, prayer times, morning brief), My reminders. Works only in your own "Message yourself" chat |
 | `!help`                                                          | Lists commands                                                                                                                                                                                                                                                                    |
 | `!ping`                                                          | Replies `pong`                                                                                                                                                                                                                                                                    |
+| `!stop` / `!restart`                                             | Stop the bot (stays stopped until you start it again) / restart it. Only works in your own chat                                                                                                                                                                                   |
 | `!remind 6pm buy milk`                                           | Reminds you (`18:00`, `6:30pm`, `in 10m`, `tomorrow 7am`)                                                                                                                                                                                                                         |
 | `!reminders` / `!cancel 1`                                       | List / cancel pending reminders and scheduled messages                                                                                                                                                                                                                            |
 | `!contact add wife 923001234567`                                 | Save a name for a number (country code, no `+`)                                                                                                                                                                                                                                   |
@@ -65,7 +66,7 @@ Start-ScheduledTask -TaskName "WhatsAppBot"
 ```
 
 - `start-bot.bat` restarts the bot if it crashes and logs to `bot\data\bot.log`.
-- To **stop** the bot, run `bot\stop-bot.bat`. To remove the task:
+- To **stop** the bot, send `!stop` in WhatsApp, or run `bot\stop-bot.bat`. To **start** it, double-click `bot\start-now.bat` (or `Start-ScheduledTask -TaskName "WhatsAppBot"`). To remove the task:
   `Unregister-ScheduledTask -TaskName "WhatsAppBot" -Confirm:$false`.
 
 ## Notes
