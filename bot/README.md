@@ -4,17 +4,17 @@ A small assistant built on whatsapp-web.js. It runs as a linked device on your o
 WhatsApp account and obeys messages **you** send (from your own "Message yourself"
 chat). Messages from anyone else are ignored.
 
-| Command                           | What it does                                                                                                                                                                               |
-| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `!menu`                           | Sends a tap-to-choose poll: Remind me, Schedule a message, My reminders, Today's expenses, Help. Remind/Schedule then ask you step by step. Works only in your own "Message yourself" chat |
-| `!help`                           | Lists commands                                                                                                                                                                             |
-| `!ping`                           | Replies `pong`                                                                                                                                                                             |
-| `!remind 6pm buy milk`            | Reminds you (`18:00`, `6:30pm`, `in 10m`, `tomorrow 7am`)                                                                                                                                  |
-| `!reminders` / `!cancel 1`        | List / cancel pending reminders and scheduled messages                                                                                                                                     |
-| `!contact add wife 923001234567`  | Save a name for a number (country code, no `+`)                                                                                                                                            |
-| `!contacts`                       | List saved names                                                                                                                                                                           |
-| `!schedule 7am wife Good morning` | Sends that message to a saved contact at that time                                                                                                                                         |
-| `!spent 12 lunch` / `!today`      | Log an expense / show today's total                                                                                                                                                        |
+| Command                           | What it does                                                                                                                                                                                                                        |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `!menu`                           | Sends a tap-to-choose poll: Remind me, Schedule a message, My reminders, Today's expenses, Help. Remind/Schedule then let you tap who and when (or type them) and write the message. Works only in your own "Message yourself" chat |
+| `!help`                           | Lists commands                                                                                                                                                                                                                      |
+| `!ping`                           | Replies `pong`                                                                                                                                                                                                                      |
+| `!remind 6pm buy milk`            | Reminds you (`18:00`, `6:30pm`, `in 10m`, `tomorrow 7am`)                                                                                                                                                                           |
+| `!reminders` / `!cancel 1`        | List / cancel pending reminders and scheduled messages                                                                                                                                                                              |
+| `!contact add wife 923001234567`  | Save a name for a number (country code, no `+`)                                                                                                                                                                                     |
+| `!contacts`                       | List saved names                                                                                                                                                                                                                    |
+| `!schedule 7am wife Good morning` | Sends that message to a saved contact at that time                                                                                                                                                                                  |
+| `!spent 12 lunch` / `!today`      | Log an expense / show today's total                                                                                                                                                                                                 |
 
 Reminder times use UTC+5 by default. Change it with `TZ_OFFSET_MIN` (minutes from UTC).
 

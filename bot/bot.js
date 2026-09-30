@@ -231,19 +231,54 @@ async function sendMenu(chat) {
     menuPolls.set(poll.id._serialized, chat);
 }
 
-function prompt(f) {
-    switch (FLOW_STEPS[f.kind][f.step]) {
-        case 'who': {
-            const names = Object.keys(loadContacts()).join(', ');
-            return `Who should get the message? Saved: ${names}\n(send "cancel" to stop)`;
-        }
-        case 'time':
-            return 'When? For example: 6pm, 18:30, in 10m, tomorrow 7am\n(send "cancel" to stop)';
-        default:
-            return f.kind === 'remind'
-                ? 'What should I remind you about?'
-                : `What message should I send to ${f.data.name}?`;
+const CANCEL_OPT = '✖ Cancel';
+const OTHER_TIME = '🕒 Other time…';
+const TIME_CHOICES = {
+    'In 1 hour': () => Date.now() + 3600000,
+    'Tonight 9pm': () => parseWhen('9pm'),
+    'Tomorrow 7am': () => parseWhen('7am', 1),
+    'Tomorrow 9am': () => parseWhen('9am', 1),
+};
+const TIME_PROMPT =
+    'When? For example: 6pm, 18:30, in 10m, tomorrow 7am\n(send "cancel" to stop)';
+const flowPolls = new Map(); // flow poll message id -> chat
+
+async function sendFlowPoll(chat, f, title, options) {
+    const poll = await client.sendMessage(
+        chat,
+        new Poll(MARK + title, options),
+    );
+    f.pollId = poll.id._serialized;
+    flowPolls.set(f.pollId, chat);
+}
+
+// Asks the question for the flow's current step (a poll to tap, or a text prompt).
+async function askStep(chat, f) {
+    const step = FLOW_STEPS[f.kind][f.step];
+    if (step === 'who') {
+        const names = Object.keys(loadContacts());
+        if (names.length <= 11)
+            return sendFlowPoll(chat, f, 'Who should get the message?', [
+                ...names,
+                CANCEL_OPT,
+            ]);
+        return send(
+            chat,
+            `Who should get the message? Type a saved name: ${names.join(', ')}\n(send "cancel" to stop)`,
+        );
     }
+    if (step === 'time')
+        return sendFlowPoll(chat, f, 'When?', [
+            ...Object.keys(TIME_CHOICES),
+            OTHER_TIME,
+            CANCEL_OPT,
+        ]);
+    return send(
+        chat,
+        f.kind === 'remind'
+            ? '✍️ What should I remind you about?'
+            : `✍️ Write your message to ${f.data.name}:`,
+    );
 }
 
 async function startFlow(chat, kind) {
@@ -256,7 +291,30 @@ async function startFlow(chat, kind) {
     }
     const f = { kind, step: 0, data: {}, expires: Date.now() + FLOW_MS };
     flows.set(chat, f);
-    return send(chat, prompt(f));
+    return askStep(chat, f);
+}
+
+async function cancelFlow(chat) {
+    flows.delete(chat);
+    await send(chat, 'Okay, cancelled.');
+    return sendMenu(chat);
+}
+
+// Called once the current step has its answer: ask the next question, or finish.
+async function advance(chat, f) {
+    f.step++;
+    f.pollId = null;
+    f.typedTime = false;
+    f.expires = Date.now() + FLOW_MS;
+    if (f.step < FLOW_STEPS[f.kind].length) return askStep(chat, f);
+    flows.delete(chat);
+    await send(
+        chat,
+        f.kind === 'remind'
+            ? addReminder(chat, f.data.when, f.data.text)
+            : addScheduled(chat, f.data.when, f.data.name, f.data.text),
+    );
+    return sendMenu(chat);
 }
 
 // Returns true if the text was an answer to a pending question.
@@ -268,9 +326,7 @@ async function handleFlowAnswer(chat, body) {
         return false;
     }
     if (/^(cancel|stop)$/i.test(body)) {
-        flows.delete(chat);
-        await send(chat, 'Okay, cancelled.');
-        await sendMenu(chat);
+        await cancelFlow(chat);
         return true;
     }
     const step = FLOW_STEPS[f.kind][f.step];
@@ -298,28 +354,49 @@ async function handleFlowAnswer(chat, body) {
     } else {
         f.data.text = body;
     }
-    f.step++;
-    f.expires = Date.now() + FLOW_MS;
-    if (f.step < FLOW_STEPS[f.kind].length) {
-        await send(chat, prompt(f));
-        return true;
-    }
-    flows.delete(chat);
-    await send(
-        chat,
-        f.kind === 'remind'
-            ? addReminder(chat, f.data.when, f.data.text)
-            : addScheduled(chat, f.data.when, f.data.name, f.data.text),
-    );
-    await sendMenu(chat);
+    await advance(chat, f);
     return true;
 }
 
+// A tap on one of the flow's own polls (who / when).
+async function handleFlowVote(chat, f, choice) {
+    if (choice === CANCEL_OPT) {
+        f.pollId = null;
+        return cancelFlow(chat);
+    }
+    const step = FLOW_STEPS[f.kind][f.step];
+    if (step === 'who') {
+        const name = choice.toLowerCase();
+        if (!loadContacts()[name]) return;
+        f.pollId = null;
+        f.data.name = name;
+        return advance(chat, f);
+    }
+    if (step !== 'time') return;
+    f.pollId = null;
+    if (choice === OTHER_TIME) {
+        f.typedTime = true;
+        return send(chat, TIME_PROMPT);
+    }
+    if (!TIME_CHOICES[choice]) return;
+    f.data.when = TIME_CHOICES[choice]();
+    return advance(chat, f);
+}
+
 async function handleVote(vote) {
-    const chat = menuPolls.get(vote.parentMessage?.id?._serialized);
-    if (!chat || !vote.selectedOptions.length) return;
-    const key = (MENU.find((m) => m[0] === vote.selectedOptions[0].name) ||
-        [])[1];
+    const pollId = vote.parentMessage?.id?._serialized;
+    if (!vote.selectedOptions.length) return;
+    const choice = vote.selectedOptions[0].name;
+    const flowChat = flowPolls.get(pollId);
+    if (flowChat) {
+        const f = flows.get(flowChat);
+        if (f && f.pollId === pollId)
+            return handleFlowVote(flowChat, f, choice);
+        return; // an old or already-answered flow poll
+    }
+    const chat = menuPolls.get(pollId);
+    if (!chat) return;
+    const key = (MENU.find((m) => m[0] === choice) || [])[1];
     flows.delete(chat);
     if (key === 'remind' || key === 'schedule') return startFlow(chat, key);
     if (key === 'reminders') await send(chat, remindersText(chat));
