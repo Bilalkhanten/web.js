@@ -44,12 +44,21 @@ The login is saved in `bot/data/`, so you only scan once.
 
 ## Start automatically when you log in (Windows)
 
-1. Press `Win+R`, type `shell:startup`, press Enter.
-2. Right-click `bot\start-bot.bat` → **Show more options** → **Create shortcut**, and
-   move the shortcut into the Startup folder that opened.
-3. Optional: right-click the shortcut → Properties → Run: **Minimized**.
+Register a scheduled task that runs the bot **hidden** (closing a visible window stops
+the bot). In PowerShell, from the repo folder:
 
-`start-bot.bat` restarts the bot if it crashes and writes a log to `bot\data\bot.log`.
+```powershell
+$vbs = "$PWD\bot\start-hidden.vbs"
+$action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$vbs`"" -WorkingDirectory "$PWD\bot"
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable
+Register-ScheduledTask -TaskName "WhatsAppBot" -Action $action -Trigger $trigger -Settings $settings
+Start-ScheduledTask -TaskName "WhatsAppBot"
+```
+
+- `start-bot.bat` restarts the bot if it crashes and logs to `bot\data\bot.log`.
+- To **stop** the bot, run `bot\stop-bot.bat`. To remove the task:
+  `Unregister-ScheduledTask -TaskName "WhatsAppBot" -Confirm:$false`.
 
 ## Notes
 
