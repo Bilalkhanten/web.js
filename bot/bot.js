@@ -25,6 +25,10 @@ fs.mkdirSync(DATA, { recursive: true });
 const REMINDERS = path.join(DATA, 'reminders.json');
 const CONTACTS = path.join(DATA, 'contacts.json');
 const EXPENSES = path.join(DATA, 'expenses.csv');
+const SHOPPING = path.join(DATA, 'shopping.json');
+const BIRTHDAYS = path.join(DATA, 'birthdays.json');
+const TEMPLATES = path.join(DATA, 'templates.json');
+const STATE = path.join(DATA, 'state.json');
 const STALE_MS = 15 * 60000; // never send messages that are more than this late
 
 const client = new Client({
@@ -114,12 +118,29 @@ function expensesToday() {
         .filter((x) => x && x.d === today());
 }
 
+const isWeekend = (ms) =>
+    [0, 6].includes(new Date(ms + TZ_OFFSET_MIN * 60000).getUTCDay());
+
+/** Next occurrence of a repeating reminder that is still in the future. */
+function nextDue(due, repeat, now) {
+    let d = due;
+    do {
+        d += 86400000 * (repeat === 'weekly' ? 7 : 1);
+        if (repeat === 'weekdays') while (isWeekend(d)) d += 86400000;
+    } while (d <= now);
+    return d;
+}
+
 async function fireDue() {
     const all = load();
     const now = Date.now();
     const due = all.filter((r) => r.due <= now);
     if (!due.length) return;
-    save(all.filter((r) => r.due > now));
+    // Repeating reminders are put back with their next time; everything else is removed.
+    const again = due
+        .filter((r) => r.repeat)
+        .map((r) => ({ ...r, due: nextDue(r.due, r.repeat, now) }));
+    save([...all.filter((r) => r.due > now), ...again]);
     for (const r of due) {
         // A stale message (bot was offline) is reported to you instead of sent late.
         if (now - r.due > STALE_MS) {
@@ -181,7 +202,7 @@ function remindersText(chat) {
         ? mine
               .map(
                   (r, i) =>
-                      `${i + 1}. ${fmt(r.due)} ${r.to ? '→ ' + r.toName + ': ' : '- '}${r.text}`,
+                      `${i + 1}. ${fmt(r.due)} ${r.repeat ? '🔁 ' : ''}${r.to ? '→ ' + r.toName + ': ' : '- '}${r.text}`,
               )
               .join('\n')
         : 'No pending reminders.';
@@ -198,18 +219,154 @@ function todayText() {
 // ---- Poll menu (!menu) and the step-by-step questions it starts ----
 const MENU = [
     ['⏰ Remind me', 'remind'],
+    ['🔁 Repeat reminder', 'repeat'],
     ['📨 Schedule a message', 'schedule'],
+    ['💬 Quick message', 'quick'],
+    ['👥 Message a group', 'group'],
+    ['🛒 Shopping list', 'shop'],
+    ['🎂 Birthdays', 'birthdays'],
     ['📋 My reminders', 'reminders'],
-    ["💸 Today's expenses", 'today'],
-    ['❓ Help', 'help'],
 ];
 const menuPolls = new Map(); // poll message id -> chat it was sent in
-const flows = new Map(); // chat -> { kind, step, data, expires }
+const flowPolls = new Map(); // flow poll message id -> chat
+const flows = new Map(); // chat -> { kind, step, data, expires, pollId }
 const FLOW_MS = 10 * 60000;
-const FLOW_STEPS = {
-    remind: ['time', 'text'],
-    schedule: ['who', 'time', 'text'],
+const CANCEL_OPT = '✖ Cancel';
+const OTHER_TIME = '🕒 Other time…';
+const WRITE_OWN = '✍️ Write my own…';
+const TIME_PROMPT =
+    'When? For example: 6pm, 18:30, in 10m, tomorrow 7am\n(send "cancel" to stop)';
+const TIME_CHOICES = {
+    'In 1 hour': () => Date.now() + 3600000,
+    'Tonight 9pm': () => parseWhen('9pm'),
+    'Tomorrow 7am': () => parseWhen('7am', 1),
+    'Tomorrow 9am': () => parseWhen('9am', 1),
 };
+const DAY_TIMES = {
+    '7:00 am': '7am',
+    '9:00 am': '9am',
+    '12:00 pm': '12pm',
+    '6:00 pm': '6pm',
+    '9:00 pm': '9pm',
+};
+const FREQS = {
+    'Every day': 'daily',
+    'Every weekday (Mon-Fri)': 'weekdays',
+    'Every week': 'weekly',
+};
+const FREQ_LABEL = {
+    daily: 'every day',
+    weekdays: 'every weekday',
+    weekly: 'every week',
+};
+const DEFAULT_TEMPLATES = [
+    'Good morning ❤️',
+    'On my way',
+    'Call me when you are free',
+    'I will be late',
+    'Thank you 🙏',
+];
+const MONTHS = [
+    'jan',
+    'feb',
+    'mar',
+    'apr',
+    'may',
+    'jun',
+    'jul',
+    'aug',
+    'sep',
+    'oct',
+    'nov',
+    'dec',
+];
+
+const isGroupId = (id) => id.endsWith('@g.us');
+function contactNames(groupsOnly) {
+    const c = loadContacts();
+    return Object.keys(c).filter((n) => isGroupId(c[n]) === groupsOnly);
+}
+const loadTemplates = () => readJson(TEMPLATES, DEFAULT_TEMPLATES);
+const loadShopping = () => readJson(SHOPPING, []);
+const saveShopping = (l) => fs.writeFileSync(SHOPPING, JSON.stringify(l));
+const loadBirthdays = () => readJson(BIRTHDAYS, []);
+const saveBirthdays = (l) =>
+    fs.writeFileSync(BIRTHDAYS, JSON.stringify(l, null, 2));
+
+function addRepeating(chat, when, freq, text) {
+    while (freq === 'weekdays' && isWeekend(when)) when += 86400000;
+    const all = load();
+    all.push({ due: when, text, chat, repeat: freq });
+    save(all);
+    return `✅ Okay, I'll remind you ${FREQ_LABEL[freq]} (first: ${fmt(when)}): ${text}\n(Use !reminders to review, !cancel <number> to stop it)`;
+}
+
+/** "15/03", "15-3", "15 March", "March 15" -> { day, month } (day first, like 15/03). */
+function parseDayMonth(text) {
+    const t = text.trim().toLowerCase();
+    let day, month, m;
+    if ((m = /^(\d{1,2})\s*[/\-. ]\s*(\d{1,2})$/.exec(t))) {
+        day = Number(m[1]);
+        month = Number(m[2]);
+    } else if ((m = /^(\d{1,2})(?:st|nd|rd|th)?\s+([a-z]{3,})$/.exec(t))) {
+        day = Number(m[1]);
+        month = MONTHS.indexOf(m[2].slice(0, 3)) + 1;
+    } else if ((m = /^([a-z]{3,})\s+(\d{1,2})(?:st|nd|rd|th)?$/.exec(t))) {
+        day = Number(m[2]);
+        month = MONTHS.indexOf(m[1].slice(0, 3)) + 1;
+    }
+    const maxDay = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+    return month >= 1 && month <= 12 && day >= 1 && day <= maxDay
+        ? { day, month }
+        : null;
+}
+
+function shopText(list) {
+    return list.length
+        ? '🛒 Shopping list:\n' +
+              list.map((x, i) => `${i + 1}. ${x}`).join('\n')
+        : '🛒 Your shopping list is empty.';
+}
+
+function birthdaysText() {
+    const n = localNow();
+    const y = n.getUTCFullYear();
+    const startOfToday = Date.UTC(y, n.getUTCMonth(), n.getUTCDate());
+    const rows = loadBirthdays()
+        .map((b) => {
+            let t = Date.UTC(y, b.month - 1, b.day);
+            if (t < startOfToday) t = Date.UTC(y + 1, b.month - 1, b.day);
+            return { ...b, days: Math.round((t - startOfToday) / 86400000) };
+        })
+        .sort((a, b) => a.days - b.days)
+        .slice(0, 10);
+    return rows.length
+        ? '🎂 Upcoming birthdays:\n' +
+              rows
+                  .map(
+                      (b) =>
+                          `• ${b.day} ${MONTHS[b.month - 1]} - ${b.name} (${b.days === 0 ? 'today' : 'in ' + b.days + ' days'})`,
+                  )
+                  .join('\n')
+        : '🎂 No birthdays saved yet.';
+}
+
+// Once a day (after 8am) remind you about today's and tomorrow's birthdays.
+async function checkBirthdays() {
+    const n = localNow();
+    if (n.getUTCHours() < 8) return;
+    const st = readJson(STATE, {});
+    if (st.birthdays === today()) return;
+    st.birthdays = today();
+    fs.writeFileSync(STATE, JSON.stringify(st));
+    const t = new Date(n.getTime() + 86400000);
+    for (const b of loadBirthdays()) {
+        if (b.month === n.getUTCMonth() + 1 && b.day === n.getUTCDate())
+            await send(b.chat, `🎂 Today is ${b.name}'s birthday!`);
+        else if (b.month === t.getUTCMonth() + 1 && b.day === t.getUTCDate())
+            await send(b.chat, `🎂 Tomorrow is ${b.name}'s birthday.`);
+    }
+}
 
 // The menu is only offered in your own "Message yourself" chat, so nobody else can vote on it.
 async function isSelfChat(chat) {
@@ -232,17 +389,294 @@ async function sendMenu(chat) {
     menuPolls.set(poll.id._serialized, chat);
 }
 
-const CANCEL_OPT = '✖ Cancel';
-const OTHER_TIME = '🕒 Other time…';
-const TIME_CHOICES = {
-    'In 1 hour': () => Date.now() + 3600000,
-    'Tonight 9pm': () => parseWhen('9pm'),
-    'Tomorrow 7am': () => parseWhen('7am', 1),
-    'Tomorrow 9am': () => parseWhen('9am', 1),
+function typedTime(f, text) {
+    const toks = text.split(/\s+/);
+    const { when, used } = parseTimeTokens(toks);
+    if (!when || used !== toks.length)
+        return "I couldn't read that time. Try 6pm, 18:30, in 10m or tomorrow 7am.";
+    f.data.when = when;
+    return null;
+}
+
+// Each step is either a poll to tap (poll + tap) and/or a text answer (prompt + typed).
+// tap() returns 'ok' (answer accepted), 'retype' (now type the answer) or 'ignore'.
+const STEP = {
+    who: {
+        names: (f) => contactNames(f.kind === 'group'),
+        poll(f) {
+            const n = this.names(f);
+            return n.length <= 11
+                ? {
+                      title:
+                          f.kind === 'group'
+                              ? 'Which group?'
+                              : 'Who should get the message?',
+                      options: [...n, CANCEL_OPT],
+                  }
+                : null;
+        },
+        prompt(f) {
+            return `Type a saved name: ${this.names(f).join(', ')}\n(send "cancel" to stop)`;
+        },
+        tap(f, c) {
+            if (!this.names(f).includes(c.toLowerCase())) return 'ignore';
+            f.data.name = c.toLowerCase();
+            return 'ok';
+        },
+        typed(f, t) {
+            if (this.tap(f, t) === 'ok') return null;
+            return `I don't know "${t}". Saved: ${this.names(f).join(', ')}`;
+        },
+    },
+    time: {
+        poll: () => ({
+            title: 'When?',
+            options: [...Object.keys(TIME_CHOICES), OTHER_TIME, CANCEL_OPT],
+        }),
+        prompt: () => TIME_PROMPT,
+        tap(f, c) {
+            if (c === OTHER_TIME) return 'retype';
+            if (!TIME_CHOICES[c]) return 'ignore';
+            f.data.when = TIME_CHOICES[c]();
+            return 'ok';
+        },
+        typed: typedTime,
+    },
+    rtime: {
+        poll: () => ({
+            title: 'What time of day?',
+            options: [...Object.keys(DAY_TIMES), OTHER_TIME, CANCEL_OPT],
+        }),
+        prompt: () => TIME_PROMPT,
+        tap(f, c) {
+            if (c === OTHER_TIME) return 'retype';
+            if (!DAY_TIMES[c]) return 'ignore';
+            f.data.when = parseWhen(DAY_TIMES[c]);
+            return 'ok';
+        },
+        typed: typedTime,
+    },
+    freq: {
+        poll: () => ({
+            title: 'How often?',
+            options: [...Object.keys(FREQS), CANCEL_OPT],
+        }),
+        prompt: () => 'Type daily, weekdays or weekly',
+        tap(f, c) {
+            if (!FREQS[c]) return 'ignore';
+            f.data.freq = FREQS[c];
+            return 'ok';
+        },
+        typed(f, t) {
+            const k = ['daily', 'weekdays', 'weekly'].find(
+                (x) => x === t.toLowerCase(),
+            );
+            if (!k) return 'Tap an option, or type daily, weekdays or weekly.';
+            f.data.freq = k;
+            return null;
+        },
+    },
+    text: {
+        prompt: (f) =>
+            f.kind === 'remind' || f.kind === 'repeat'
+                ? '✍️ What should I remind you about?'
+                : f.data.name
+                  ? `✍️ Write your message to ${f.data.name}:`
+                  : '✍️ Write your message:',
+        typed(f, t) {
+            f.data.text = t;
+            return null;
+        },
+    },
+    template: {
+        poll: () => ({
+            title: 'Which message?',
+            options: [...loadTemplates().slice(0, 9), WRITE_OWN, CANCEL_OPT],
+        }),
+        prompt: () => 'Pick a message',
+        tap(f, c) {
+            if (c === WRITE_OWN) f.data.custom = true;
+            else if (loadTemplates().includes(c)) f.data.text = c;
+            else return 'ignore';
+            return 'ok';
+        },
+    },
+    shopAction: {
+        acts: {
+            '➕ Add item': 'add',
+            '📄 Show list': 'show',
+            '✅ Remove item': 'remove',
+            '🧹 Clear list': 'clear',
+        },
+        poll() {
+            return {
+                title: 'Shopping list',
+                options: [...Object.keys(this.acts), CANCEL_OPT],
+            };
+        },
+        prompt: () => 'Tap an option',
+        tap(f, c) {
+            if (!this.acts[c]) return 'ignore';
+            f.data.action = this.acts[c];
+            return 'ok';
+        },
+    },
+    item: {
+        prompt: () =>
+            '✍️ Which item(s)? Separate several with commas.\n(send "cancel" to stop)',
+        typed(f, t) {
+            f.data.items = t
+                .split(/[,\n]/)
+                .map((x) => x.trim())
+                .filter(Boolean);
+            return f.data.items.length
+                ? null
+                : 'Please type at least one item.';
+        },
+    },
+    shopRemove: {
+        poll() {
+            const items = loadShopping();
+            return items.length <= 11
+                ? {
+                      title: 'Remove which item?',
+                      options: [...items, CANCEL_OPT],
+                  }
+                : null;
+        },
+        prompt: () => 'Type the number or name of the item to remove',
+        tap(f, c) {
+            if (!loadShopping().includes(c)) return 'ignore';
+            f.data.item = c;
+            return 'ok';
+        },
+        typed(f, t) {
+            const items = loadShopping();
+            const hit = /^\d+$/.test(t)
+                ? items[Number(t) - 1]
+                : items.find((x) => x.toLowerCase() === t.toLowerCase());
+            if (!hit) return "I couldn't find that item. " + shopText(items);
+            f.data.item = hit;
+            return null;
+        },
+    },
+    shopConfirm: {
+        poll: () => ({
+            title: 'Clear the whole shopping list?',
+            options: ['Yes, clear it', 'No, keep it', CANCEL_OPT],
+        }),
+        prompt: () => 'Tap Yes or No',
+        tap(f, c) {
+            if (c !== 'Yes, clear it' && c !== 'No, keep it') return 'ignore';
+            f.data.confirm = c === 'Yes, clear it';
+            return 'ok';
+        },
+    },
+    bAction: {
+        acts: { '➕ Add birthday': 'add', '📅 Upcoming': 'upcoming' },
+        poll() {
+            return {
+                title: 'Birthdays',
+                options: [...Object.keys(this.acts), CANCEL_OPT],
+            };
+        },
+        prompt: () => 'Tap an option',
+        tap(f, c) {
+            if (!this.acts[c]) return 'ignore';
+            f.data.action = this.acts[c];
+            return 'ok';
+        },
+    },
+    bname: {
+        prompt: () => "✍️ Whose birthday? Type the person's name:",
+        typed(f, t) {
+            f.data.name = t;
+            return null;
+        },
+    },
+    bdate: {
+        prompt: (f) =>
+            `✍️ What date is ${f.data.name}'s birthday? For example 15/03 or 15 March (day first)`,
+        typed(f, t) {
+            const d = parseDayMonth(t);
+            if (!d) return "I couldn't read that date. Try 15/03 or 15 March.";
+            f.data.day = d.day;
+            f.data.month = d.month;
+            return null;
+        },
+    },
 };
-const TIME_PROMPT =
-    'When? For example: 6pm, 18:30, in 10m, tomorrow 7am\n(send "cancel" to stop)';
-const flowPolls = new Map(); // flow poll message id -> chat
+
+const scheduleDone = (chat, d) => addScheduled(chat, d.when, d.name, d.text);
+const FLOWS = {
+    remind: {
+        steps: () => ['time', 'text'],
+        done: (chat, d) => addReminder(chat, d.when, d.text),
+    },
+    repeat: {
+        steps: () => ['rtime', 'freq', 'text'],
+        done: (chat, d) => addRepeating(chat, d.when, d.freq, d.text),
+    },
+    schedule: { steps: () => ['who', 'time', 'text'], done: scheduleDone },
+    group: { steps: () => ['who', 'time', 'text'], done: scheduleDone },
+    quick: {
+        steps: (d) => [
+            'template',
+            ...(d.custom ? ['text'] : []),
+            'who',
+            'time',
+        ],
+        done: scheduleDone,
+    },
+    shop: {
+        steps(d) {
+            const n = loadShopping().length;
+            if (d.action === 'add') return ['shopAction', 'item'];
+            if (d.action === 'remove' && n) return ['shopAction', 'shopRemove'];
+            if (d.action === 'clear' && n) return ['shopAction', 'shopConfirm'];
+            return ['shopAction'];
+        },
+        done(chat, d) {
+            const list = loadShopping();
+            if (d.action === 'add') {
+                const have = new Set(list.map((x) => x.toLowerCase()));
+                const added = [];
+                for (const i of d.items)
+                    if (!have.has(i.toLowerCase())) {
+                        list.push(i);
+                        have.add(i.toLowerCase());
+                        added.push(i);
+                    }
+                saveShopping(list);
+                return `🛒 Added: ${added.join(', ') || '(already on the list)'}\n\n${shopText(list)}`;
+            }
+            if (d.action === 'remove' && d.item !== undefined) {
+                saveShopping(list.filter((x) => x !== d.item));
+                return `✅ Removed: ${d.item}\n\n${shopText(loadShopping())}`;
+            }
+            if (d.action === 'clear' && d.confirm !== undefined) {
+                if (!d.confirm) return 'Okay, kept the list.';
+                saveShopping([]);
+                return '🧹 Shopping list cleared.';
+            }
+            return shopText(list);
+        },
+    },
+    birthdays: {
+        steps: (d) =>
+            d.action === 'add' ? ['bAction', 'bname', 'bdate'] : ['bAction'],
+        done(chat, d) {
+            if (d.action !== 'add') return birthdaysText();
+            const all = loadBirthdays();
+            all.push({ name: d.name, day: d.day, month: d.month, chat });
+            saveBirthdays(all);
+            return `🎂 Saved: ${d.name} - ${d.day} ${MONTHS[d.month - 1]}. I'll remind you the day before and on the day.`;
+        },
+    },
+};
+
+const stepsOf = (f) => FLOWS[f.kind].steps(f.data);
+const curDef = (f) => STEP[stepsOf(f)[f.step]];
 
 async function sendFlowPoll(chat, f, title, options) {
     const poll = await client.sendMessage(
@@ -255,39 +689,21 @@ async function sendFlowPoll(chat, f, title, options) {
 
 // Asks the question for the flow's current step (a poll to tap, or a text prompt).
 async function askStep(chat, f) {
-    const step = FLOW_STEPS[f.kind][f.step];
-    if (step === 'who') {
-        const names = Object.keys(loadContacts());
-        if (names.length <= 11)
-            return sendFlowPoll(chat, f, 'Who should get the message?', [
-                ...names,
-                CANCEL_OPT,
-            ]);
-        return send(
-            chat,
-            `Who should get the message? Type a saved name: ${names.join(', ')}\n(send "cancel" to stop)`,
-        );
-    }
-    if (step === 'time')
-        return sendFlowPoll(chat, f, 'When?', [
-            ...Object.keys(TIME_CHOICES),
-            OTHER_TIME,
-            CANCEL_OPT,
-        ]);
-    return send(
-        chat,
-        f.kind === 'remind'
-            ? '✍️ What should I remind you about?'
-            : `✍️ Write your message to ${f.data.name}:`,
-    );
+    const def = curDef(f);
+    const p = def.poll && def.poll(f);
+    if (p) return sendFlowPoll(chat, f, p.title, p.options);
+    return send(chat, def.prompt(f));
 }
 
 async function startFlow(chat, kind) {
-    if (kind === 'schedule' && !Object.keys(loadContacts()).length) {
-        await send(
-            chat,
-            'No saved contacts yet. Save one first: !contact add wife 923001234567',
-        );
+    const problem =
+        (kind === 'schedule' || kind === 'quick') && !contactNames(false).length
+            ? 'No saved contacts yet. Save one first: !contact add wife 923001234567'
+            : kind === 'group' && !contactNames(true).length
+              ? 'No saved groups yet. Save one first: !group add family <exact group name>'
+              : null;
+    if (problem) {
+        await send(chat, problem);
         return sendMenu(chat);
     }
     const f = { kind, step: 0, data: {}, expires: Date.now() + FLOW_MS };
@@ -305,16 +721,10 @@ async function cancelFlow(chat) {
 async function advance(chat, f) {
     f.step++;
     f.pollId = null;
-    f.typedTime = false;
     f.expires = Date.now() + FLOW_MS;
-    if (f.step < FLOW_STEPS[f.kind].length) return askStep(chat, f);
+    if (f.step < stepsOf(f).length) return askStep(chat, f);
     flows.delete(chat);
-    await send(
-        chat,
-        f.kind === 'remind'
-            ? addReminder(chat, f.data.when, f.data.text)
-            : addScheduled(chat, f.data.when, f.data.name, f.data.text),
-    );
+    await send(chat, FLOWS[f.kind].done(chat, f.data));
     return sendMenu(chat);
 }
 
@@ -330,57 +740,37 @@ async function handleFlowAnswer(chat, body) {
         await cancelFlow(chat);
         return true;
     }
-    const step = FLOW_STEPS[f.kind][f.step];
-    if (step === 'time') {
-        const toks = body.split(/\s+/);
-        const { when, used } = parseTimeTokens(toks);
-        if (!when || used !== toks.length) {
-            await send(
-                chat,
-                "I couldn't read that time. Try 6pm, 18:30, in 10m or tomorrow 7am.",
-            );
-            return true;
-        }
-        f.data.when = when;
-    } else if (step === 'who') {
-        const name = body.toLowerCase();
-        if (!loadContacts()[name]) {
-            await send(
-                chat,
-                `I don't know "${body}". Saved: ${Object.keys(loadContacts()).join(', ')}`,
-            );
-            return true;
-        }
-        f.data.name = name;
+    const def = curDef(f);
+    let error = null;
+    if (def.typed) {
+        error = def.typed(f, body);
     } else {
-        f.data.text = body;
+        // Poll-only step: accept the option's text typed out.
+        const opt = ((def.poll && def.poll(f)) || { options: [] }).options.find(
+            (o) => o.toLowerCase() === body.toLowerCase(),
+        );
+        if (!opt || def.tap(f, opt) !== 'ok')
+            error = 'Please tap one of the options above (or send "cancel").';
+    }
+    if (error) {
+        await send(chat, error);
+        return true;
     }
     await advance(chat, f);
     return true;
 }
 
-// A tap on one of the flow's own polls (who / when).
+// A tap on one of the flow's own polls.
 async function handleFlowVote(chat, f, choice) {
     if (choice === CANCEL_OPT) {
         f.pollId = null;
         return cancelFlow(chat);
     }
-    const step = FLOW_STEPS[f.kind][f.step];
-    if (step === 'who') {
-        const name = choice.toLowerCase();
-        if (!loadContacts()[name]) return;
-        f.pollId = null;
-        f.data.name = name;
-        return advance(chat, f);
-    }
-    if (step !== 'time') return;
+    const def = curDef(f);
+    const result = def.tap ? def.tap(f, choice) : 'ignore';
+    if (result === 'ignore') return;
     f.pollId = null;
-    if (choice === OTHER_TIME) {
-        f.typedTime = true;
-        return send(chat, TIME_PROMPT);
-    }
-    if (!TIME_CHOICES[choice]) return;
-    f.data.when = TIME_CHOICES[choice]();
+    if (result === 'retype') return send(chat, def.prompt(f));
     return advance(chat, f);
 }
 
@@ -399,11 +789,9 @@ async function handleVote(vote) {
     if (!chat) return;
     const key = (MENU.find((m) => m[0] === choice) || [])[1];
     flows.delete(chat);
-    if (key === 'remind' || key === 'schedule') return startFlow(chat, key);
-    if (key === 'reminders') await send(chat, remindersText(chat));
-    else if (key === 'today') await send(chat, todayText());
-    else if (key === 'help') await send(chat, HELP);
-    else return;
+    if (FLOWS[key]) return startFlow(chat, key);
+    if (key !== 'reminders') return;
+    await send(chat, remindersText(chat));
     return sendMenu(chat);
 }
 
@@ -416,6 +804,10 @@ const HELP = [
     '!contact add wife 923001234567 - save a name (number with country code, no +)',
     '!contacts - list saved names',
     '!schedule 7am wife Good morning  (also: tomorrow 7am, in 2h)',
+    '!group add family Our Family Group - save a WhatsApp group you are in',
+    '!groups - list saved groups',
+    '!template add Good night - add a quick message for the menu',
+    '!templates - list quick messages',
     '!spent 12 lunch - log an expense',
     "!today - today's expenses and total",
     '!menu - show a tap-to-choose menu (poll) in this chat',
@@ -489,6 +881,68 @@ async function handle(msg) {
                 return say('Usage: !schedule 7am wife Good morning');
             return say(addScheduled(chat, when, name, text));
         }
+        case '!group': {
+            const m = /^add\s+(\S+)\s+(.+)$/i.exec(arg);
+            if (!m)
+                return say(
+                    'Usage: !group add family Our Family Group (the name of the WhatsApp group)',
+                );
+            const groups = (await client.getChats()).filter((c) => c.isGroup);
+            const want = m[2].trim().toLowerCase();
+            let hits = groups.filter((g) => g.name.toLowerCase() === want);
+            if (!hits.length)
+                hits = groups.filter((g) =>
+                    g.name.toLowerCase().includes(want),
+                );
+            if (hits.length !== 1)
+                return say(
+                    hits.length
+                        ? `More than one group matches: ${hits
+                              .slice(0, 5)
+                              .map((g) => g.name)
+                              .join(' | ')}. Type the exact name.`
+                        : `No group found named "${m[2].trim()}".`,
+                );
+            const c = loadContacts();
+            c[m[1].toLowerCase()] = hits[0].id._serialized;
+            fs.writeFileSync(CONTACTS, JSON.stringify(c, null, 2));
+            return say(
+                `✅ Saved group ${m[1].toLowerCase()} -> ${hits[0].name}`,
+            );
+        }
+        case '!groups': {
+            const g = contactNames(true);
+            return say(
+                g.length
+                    ? g.map((n) => `• ${n}`).join('\n')
+                    : 'No groups. Use: !group add family <group name>',
+            );
+        }
+        case '!template': {
+            const m = /^(add|remove)\s+(.+)$/i.exec(arg);
+            if (!m)
+                return say(
+                    'Usage: !template add Good night  |  !template remove 2',
+                );
+            const list = loadTemplates().slice();
+            if (m[1].toLowerCase() === 'add') {
+                const text = m[2].trim().slice(0, 90);
+                if (!list.includes(text)) list.push(text);
+                fs.writeFileSync(TEMPLATES, JSON.stringify(list, null, 2));
+                return say('✅ Added quick message: ' + text);
+            }
+            const gone = list.splice(Number(m[2]) - 1, 1)[0];
+            if (!gone)
+                return say('Usage: !template remove <number> (see !templates)');
+            fs.writeFileSync(TEMPLATES, JSON.stringify(list, null, 2));
+            return say('Removed: ' + gone);
+        }
+        case '!templates':
+            return say(
+                loadTemplates()
+                    .map((t, i) => `${i + 1}. ${t}`)
+                    .join('\n'),
+            );
         case '!reminders':
             return say(remindersText(chat));
         case '!cancel': {
@@ -579,10 +1033,12 @@ client.on('ready', () => {
         console.log('Browser closed, exiting so the bot restarts');
         process.exit(1);
     });
-    setInterval(
-        () => fireDue().catch((e) => console.log('fireDue error', e.message)),
-        10000,
-    );
+    setInterval(() => {
+        fireDue().catch((e) => console.log('fireDue error', e.message));
+        checkBirthdays().catch((e) =>
+            console.log('birthday check error', e.message),
+        );
+    }, 10000);
     // Health check: if WhatsApp's page stops answering or is not connected for
     // 3 minutes in a row, exit so start-bot.bat restarts the bot.
     let bad = 0;
