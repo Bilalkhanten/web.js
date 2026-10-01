@@ -1,4 +1,6 @@
-# Copy this file to  .github/workflows/daily-article.yml  in the repository that holds the "daily-articles" folder.
+# Copy this file to  .github/workflows/daily-article.yml  in a NEW repository whose root is the contents of the
+# "daily-articles" folder (so package.json and publish.js sit at the top level of that repository).
+# If you keep it as a subfolder of another repository instead, add "daily-articles/" to the two run paths below.
 # Runs once a day in GitHub's cloud, so no computer of yours needs to be on.
 #
 # Setup: Settings -> Secrets and variables -> Actions
@@ -26,8 +28,8 @@ jobs:
             - uses: actions/setup-node@v4
               with:
                   node-version: 22
-            - run: npm install --prefix daily-articles --omit=dev
-            - run: node daily-articles/publish.js
+            - run: npm install --omit=dev
+            - run: node publish.js
               env:
                   ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
                   DEVTO_API_KEY: ${{ secrets.DEVTO_API_KEY }}

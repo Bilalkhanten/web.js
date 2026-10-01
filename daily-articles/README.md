@@ -61,10 +61,9 @@ Every article must pass these before it can go live:
 
 ## Running it every day
 
-**Option A - GitHub Actions (cloud, laptop can be off).** Copy `github-workflow.yml` to
-`.github/workflows/daily-article.yml` in the repository that contains this folder, add the two secrets and the
-`PUBLISH_MODE` variable (instructions are at the top of that file). To keep it fully separate from this repository,
-move the `daily-articles` folder into its own new repository and use that one. Scheduled workflows run only from a
+**Option A - GitHub Actions (cloud, laptop can be off).** Make a **new repository** whose root is the contents of this folder (it stays fully separate from everything else),
+copy `github-workflow.yml` to `.github/workflows/daily-article.yml` in it, and add the two secrets and the
+`PUBLISH_MODE` variable (instructions are at the top of that file). Scheduled workflows run only from a
 repository's default branch.
 
 **Option B - Windows Task Scheduler (laptop must be on at some point that day).** In PowerShell:
