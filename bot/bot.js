@@ -16,6 +16,23 @@ const { execFileSync } = require('child_process');
 const path = require('path');
 const qrcode = require('qrcode-terminal');
 const { Client, LocalAuth, Poll } = require('../index');
+const articles = require('./articles');
+
+// Load secrets (API keys) from bot/.env if it exists. Real environment variables win.
+(function loadEnvFile() {
+    try {
+        const text = fs.readFileSync(path.join(__dirname, '.env'), 'utf8');
+        for (const line of text.split(/\r?\n/)) {
+            const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/.exec(line);
+            if (!m || line.trim().startsWith('#')) continue;
+            let v = m[2];
+            if (/^(".*"|'.*')$/.test(v)) v = v.slice(1, -1);
+            if (!(m[1] in process.env)) process.env[m[1]] = v;
+        }
+    } catch {
+        /* no .env file: fine */
+    }
+})();
 
 const TZ_OFFSET_MIN = Number(process.env.TZ_OFFSET_MIN ?? 300);
 const DATA = path.resolve(
@@ -228,6 +245,7 @@ const MENU = [
     ['🎂 Birthdays', 'birthdays'],
     ['📰 News & markets', 'news'],
     ['🧰 Daily tools', 'tools'],
+    ['✍️ Articles', 'articles'],
     ['📋 My reminders', 'reminders'],
 ];
 const menuPolls = new Map(); // poll message id -> chat it was sent in
@@ -690,6 +708,88 @@ function typedTime(f, text) {
     return null;
 }
 
+// ---- Articles: ideas and drafts from Claude, published to dev.to only when you tap Publish ----
+const ART_PUBLISH = '📤 Publish on dev.to';
+const ART_DRAFT = '📝 Save as draft on dev.to';
+const ART_REWRITE = '🔁 Rewrite';
+const MAX_LIVE_PER_DAY = 2; // safety rail against accidental spam
+const DRAFTS = path.join(DATA, 'drafts');
+const PUBLISHED = path.join(DATA, 'published.json');
+const loadPublished = () => readJson(PUBLISHED, []);
+const articleSettings = () => loadSettings().articles || {};
+const saveArticleSettings = (patch) =>
+    saveSettings({
+        ...loadSettings(),
+        articles: { ...articleSettings(), ...patch },
+    });
+
+function saveDraftFile(d) {
+    fs.mkdirSync(DRAFTS, { recursive: true });
+    const slug = d.title
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-|-$/g, '')
+        .slice(0, 50);
+    const file = path.join(DRAFTS, `${today()}-${slug}.md`);
+    fs.writeFileSync(
+        file,
+        `# ${d.title}\n\n${d.description}\n\nTags: ${d.tags.join(', ')}\n\n${d.body_markdown}\n`,
+    );
+    return file;
+}
+
+async function sendPreview(chat, d) {
+    await send(
+        chat,
+        `📄 Draft: ${d.title}\n${d.description}\nTags: ${d.tags.join(', ') || '(none)'}`,
+    );
+    for (const part of articles.chunkText(d.body_markdown))
+        await send(chat, part);
+}
+
+async function articleDecision(chat, d) {
+    const live = d.decision === 'publish';
+    if (!d.draft) return 'No draft to publish.';
+    if (
+        live &&
+        loadPublished().filter((p) => p.date === today() && p.published)
+            .length >= MAX_LIVE_PER_DAY
+    )
+        return `⚠️ Safety limit: ${MAX_LIVE_PER_DAY} articles already published today. Choose "Save as draft" instead, or try tomorrow. Your draft is kept in bot\\data\\drafts.`;
+    const r = await articles.publishToDevto(d.draft, live);
+    const all = loadPublished();
+    all.push({
+        title: d.draft.title,
+        url: r.url,
+        date: today(),
+        published: live,
+    });
+    fs.writeFileSync(PUBLISHED, JSON.stringify(all, null, 2));
+    return live
+        ? `✅ Published: ${r.url}`
+        : `📝 Saved as a draft on dev.to (not public yet): ${r.url}\nEdit and publish it from your dev.to dashboard.`;
+}
+
+// Offers topic ideas at the chosen time each day (needs ANTHROPIC_API_KEY and your topics).
+async function checkArticleIdeas() {
+    const d = articleSettings().daily;
+    if (!d || !d.on || !d.chat) return;
+    const n = localNow();
+    const [h, m] = d.time.split(':').map(Number);
+    const since = n.getUTCHours() * 60 + n.getUTCMinutes() - (h * 60 + m);
+    if (since < 0 || since > 180 || flows.has(d.chat)) return;
+    const st = readJson(STATE, {});
+    if (st.articleIdeas === today()) return;
+    st.articleIdeas = today();
+    fs.writeFileSync(STATE, JSON.stringify(st));
+    await send(d.chat, "✍️ Time for today's article ideas.");
+    await startFlow(d.chat, 'articles', {
+        data: { mode: 'ideas' },
+        step: 1,
+        expires: Date.now() + 6 * 3600000,
+    });
+}
+
 // Each step is either a poll to tap (poll + tap) and/or a text answer (prompt + typed).
 // tap() returns 'ok' (answer accepted), 'retype' (now type the answer) or 'ignore'.
 const STEP = {
@@ -873,6 +973,149 @@ const STEP = {
         tap(f, c) {
             if (!NEWS[c]) return 'ignore';
             f.data.pick = c;
+            return 'ok';
+        },
+    },
+    artPick: {
+        acts: {
+            '💡 Ideas for today': 'ideas',
+            '📝 Write on my own topic': 'topic',
+            '🏷 My topics': 'topics',
+            '⏰ Daily ideas': 'daily',
+        },
+        poll() {
+            return {
+                title: 'Articles',
+                options: [...Object.keys(this.acts), CANCEL_OPT],
+            };
+        },
+        prompt: () => 'Tap an option',
+        tap(f, c) {
+            if (!this.acts[c]) return 'ignore';
+            f.data.mode = this.acts[c];
+            f.data.needTopics = !(articleSettings().topics || []).length;
+            return 'ok';
+        },
+    },
+    topicsText: {
+        prompt: () =>
+            '✍️ Type the topics you write about, separated by commas. For example: AI, productivity, python',
+        typed(f, t) {
+            const list = t
+                .split(',')
+                .map((x) => x.trim().slice(0, 40))
+                .filter(Boolean)
+                .slice(0, 8);
+            if (!list.length) return 'Please type at least one topic.';
+            saveArticleSettings({ topics: list });
+            f.data.topics = list;
+            return null;
+        },
+    },
+    ideaPick: {
+        async poll(f, chat) {
+            if (!f.data.ideas) {
+                const topics = articleSettings().topics || [];
+                if (!topics.length)
+                    throw new Error(
+                        'No topics yet. Set them first: !topics AI, productivity',
+                    );
+                await send(chat, '⏳ Coming up with ideas…');
+                const recent = loadPublished()
+                    .slice(-10)
+                    .map((p) => p.title);
+                f.data.ideas = [
+                    ...new Set(await articles.generateIdeas(topics, recent)),
+                ];
+            }
+            return {
+                title: "Today's article ideas",
+                options: [...f.data.ideas, CANCEL_OPT],
+            };
+        },
+        prompt: () => 'Tap an idea',
+        tap(f, c) {
+            if (!(f.data.ideas || []).includes(c)) return 'ignore';
+            f.data.topic = c;
+            return 'ok';
+        },
+        typed(f, t) {
+            const hit = (f.data.ideas || []).find(
+                (i) => i.toLowerCase() === t.toLowerCase(),
+            );
+            if (!hit)
+                return 'Please tap one of the ideas above (or send "cancel").';
+            f.data.topic = hit;
+            return null;
+        },
+    },
+    topic: {
+        prompt: () =>
+            '✍️ What should the article be about? A title or a short description.\n(send "cancel" to stop)',
+        typed(f, t) {
+            f.data.topic = t.slice(0, 300);
+            return null;
+        },
+    },
+    artDecision: {
+        // Writes the draft the first time this step is shown, previews it, then asks what to do.
+        async poll(f, chat) {
+            if (!f.data.draft) {
+                await send(
+                    chat,
+                    '⏳ Writing the draft… this takes about a minute.',
+                );
+                f.data.draft = await articles.generateDraft(f.data.topic, {
+                    feedback: f.data.feedback,
+                    previous: f.data.prev,
+                });
+                f.data.feedback = null;
+                saveDraftFile(f.data.draft);
+                await sendPreview(chat, f.data.draft);
+            }
+            return {
+                title: 'What now?',
+                options: [ART_PUBLISH, ART_DRAFT, ART_REWRITE, CANCEL_OPT],
+            };
+        },
+        prompt: () =>
+            '✍️ What should change? For example: shorter, more examples, simpler language.',
+        tap(f, c) {
+            if (c === ART_PUBLISH) f.data.decision = 'publish';
+            else if (c === ART_DRAFT) f.data.decision = 'draft';
+            else if (c === ART_REWRITE) return 'retype';
+            else return 'ignore';
+            return 'ok';
+        },
+        // Typed text is feedback for a rewrite, unless it is one of the options spelled out.
+        typed(f, t) {
+            const opt = [ART_PUBLISH, ART_DRAFT, ART_REWRITE].find(
+                (o) => o.toLowerCase() === t.toLowerCase(),
+            );
+            if (opt === ART_REWRITE) return this.prompt();
+            if (opt) return this.tap(f, opt) === 'ok' ? null : this.prompt();
+            f.data.feedback = t;
+            f.data.prev = f.data.draft;
+            f.data.draft = null;
+            return AGAIN;
+        },
+    },
+    artDaily: {
+        acts: {
+            '✅ Turn on': 'on',
+            '⛔ Turn off': 'off',
+            '🕒 Change time': 'time',
+        },
+        poll() {
+            return {
+                title: 'Daily article ideas',
+                options: [...Object.keys(this.acts), CANCEL_OPT],
+            };
+        },
+        prompt: () => 'Tap an option',
+        tap(f, c) {
+            if (!this.acts[c]) return 'ignore';
+            f.data.daily = this.acts[c];
             return 'ok';
         },
     },
@@ -1066,6 +1309,45 @@ const FLOWS = {
             return shopText(list);
         },
     },
+    articles: {
+        steps(d) {
+            if (d.mode === 'ideas')
+                return [
+                    'artPick',
+                    ...(d.needTopics ? ['topicsText'] : []),
+                    'ideaPick',
+                    'artDecision',
+                ];
+            if (d.mode === 'topic') return ['artPick', 'topic', 'artDecision'];
+            if (d.mode === 'topics') return ['artPick', 'topicsText'];
+            if (d.mode === 'daily')
+                return d.daily === 'time'
+                    ? ['artPick', 'artDaily', 'btime']
+                    : ['artPick', 'artDaily'];
+            return ['artPick'];
+        },
+        async done(chat, d) {
+            if (d.mode === 'topics')
+                return `✅ Saved your topics: ${d.topics.join(', ')}`;
+            if (d.mode === 'daily') {
+                const cur = articleSettings().daily || {};
+                const daily = {
+                    time: '08:00',
+                    ...cur,
+                    on: d.daily !== 'off',
+                    chat,
+                };
+                if (d.daily === 'time') daily.time = d.time;
+                saveArticleSettings({ daily });
+                return daily.on
+                    ? `⏰ Daily article ideas are on: every day at ${to12h(daily.time)}. (Needs your topics: !topics AI, productivity)`
+                    : '⛔ Daily article ideas are off.';
+            }
+            if (d.mode === 'ideas' || d.mode === 'topic')
+                return articleDecision(chat, d);
+            return 'Done.';
+        },
+    },
     tools: {
         steps: () => ['toolPick'],
         done: (chat, d) => ({ startFlow: d.next }),
@@ -1139,14 +1421,35 @@ async function sendFlowPoll(chat, f, title, options) {
 }
 
 // Asks the question for the flow's current step (a poll to tap, or a text prompt).
+function friendlyError(e) {
+    if (e instanceof articles.MissingKeyError)
+        return `🔑 ${e.keyName} is missing. Add it to bot\\.env on your laptop (see the README, "Articles"), then send !restart.`;
+    if (e && e.status === 401)
+        return '🔑 That API key was rejected. Check the key in bot\\.env, then send !restart.';
+    return '⚠️ ' + (e && e.message ? e.message : String(e));
+}
+
+const AGAIN = Symbol('ask this step again');
+
 async function askStep(chat, f) {
     const def = curDef(f);
-    const p = def.poll && def.poll(f);
+    let p;
+    f.busy = true; // ignore taps/typing while a slow step (like writing a draft) runs
+    try {
+        p = def.poll && (await def.poll(f, chat));
+    } catch (e) {
+        console.log('step failed:', e && e.message);
+        flows.delete(chat);
+        await send(chat, friendlyError(e));
+        return sendMenu(chat);
+    } finally {
+        f.busy = false;
+    }
     if (p) return sendFlowPoll(chat, f, p.title, p.options);
     return send(chat, def.prompt(f));
 }
 
-async function startFlow(chat, kind) {
+async function startFlow(chat, kind, init = {}) {
     const problem =
         (kind === 'schedule' || kind === 'quick') && !contactNames(false).length
             ? 'No saved contacts yet. Save one first: !contact add wife 923001234567'
@@ -1157,7 +1460,12 @@ async function startFlow(chat, kind) {
         await send(chat, problem);
         return sendMenu(chat);
     }
-    const f = { kind, step: 0, data: {}, expires: Date.now() + FLOW_MS };
+    const f = {
+        kind,
+        step: init.step || 0,
+        data: init.data || {},
+        expires: init.expires || Date.now() + FLOW_MS,
+    };
     flows.set(chat, f);
     if (!stepsOf(f).length) return finish(chat, f); // nothing to ask
     return askStep(chat, f);
@@ -1186,7 +1494,7 @@ async function finish(chat, f) {
         out = await FLOWS[f.kind].done(chat, f.data);
     } catch (e) {
         console.log('flow error', e.message);
-        out = '⚠️ Something went wrong: ' + e.message;
+        out = friendlyError(e);
     }
     if (out && out.startFlow) return startFlow(chat, out.startFlow);
     await send(chat, out);
@@ -1197,6 +1505,7 @@ async function finish(chat, f) {
 async function handleFlowAnswer(chat, body) {
     const f = flows.get(chat);
     if (!f || !body) return false;
+    if (f.busy) return true; // still working on the last answer
     if (Date.now() > f.expires) {
         flows.delete(chat);
         return false;
@@ -1208,7 +1517,7 @@ async function handleFlowAnswer(chat, body) {
     const def = curDef(f);
     let error = null;
     if (def.typed) {
-        error = await def.typed(f, body);
+        error = await def.typed(f, body, chat);
     } else {
         // Poll-only step: accept the option's text typed out.
         const opt = ((def.poll && def.poll(f)) || { options: [] }).options.find(
@@ -1216,6 +1525,10 @@ async function handleFlowAnswer(chat, body) {
         );
         if (!opt || def.tap(f, opt) !== 'ok')
             error = 'Please tap one of the options above (or send "cancel").';
+    }
+    if (error === AGAIN) {
+        await askStep(chat, f);
+        return true;
     }
     if (error) {
         await send(chat, error);
@@ -1231,6 +1544,7 @@ async function handleFlowVote(chat, f, choice) {
         f.pollId = null;
         return cancelFlow(chat);
     }
+    if (f.busy) return;
     const def = curDef(f);
     const result = def.tap ? def.tap(f, choice) : 'ignore';
     if (result === 'ignore') return;
@@ -1284,6 +1598,9 @@ const HELP = [
     "!today - today's expenses and total",
     '!menu - show a tap-to-choose menu (poll) in this chat',
     '!pause / !resume - make the bot quiet / active again',
+    '!article <topic> - write a draft (you approve before anything is published)',
+    '!ideas - topic ideas for today (!ideas on | off | time 8am for a daily offer)',
+    '!topics AI, productivity - set the topics for ideas',
     '!stop - stop the bot (start it again from your laptop)',
     '!restart - restart the bot',
     '!help - this list',
@@ -1492,6 +1809,56 @@ async function handle(msg) {
             setTimeout(() => process.exit(stopping ? 99 : 1), 2000);
             return;
         }
+        case '!article': {
+            if (!arg) return say('Usage: !article How to use pm2 on Windows');
+            return startFlow(chat, 'articles', {
+                data: { mode: 'topic', topic: arg.slice(0, 300) },
+                step: 2,
+            });
+        }
+        case '!topics': {
+            if (!arg) {
+                const t = articleSettings().topics || [];
+                return say(
+                    t.length
+                        ? 'Your topics: ' + t.join(', ')
+                        : 'No topics yet. Use: !topics AI, productivity',
+                );
+            }
+            const list = arg
+                .split(',')
+                .map((x) => x.trim().slice(0, 40))
+                .filter(Boolean)
+                .slice(0, 8);
+            saveArticleSettings({ topics: list });
+            return say('✅ Saved your topics: ' + list.join(', '));
+        }
+        case '!ideas': {
+            const [what, ...more] = arg.toLowerCase().split(/\s+/);
+            if (!what)
+                return startFlow(chat, 'articles', {
+                    data: { mode: 'ideas' },
+                    step: 1,
+                });
+            const cur = articleSettings().daily || { time: '08:00' };
+            if (what === 'off') {
+                saveArticleSettings({ daily: { ...cur, on: false, chat } });
+                return say('⛔ Daily article ideas are off.');
+            }
+            if (what === 'time') {
+                const f = { data: {} };
+                const err = STEP.btime.typed(f, more.join(' '));
+                if (err) return say(err);
+                cur.time = f.data.time;
+            } else if (what !== 'on')
+                return say(
+                    'Usage: !ideas | !ideas on | !ideas off | !ideas time 8am',
+                );
+            saveArticleSettings({ daily: { ...cur, on: true, chat } });
+            return say(
+                `⏰ Daily article ideas are on: every day at ${to12h(cur.time)}.`,
+            );
+        }
         case '!news':
             return say(Object.keys(NEWS).map(newsText).join('\n\n'));
         case '!groups': {
@@ -1629,6 +1996,9 @@ client.on('ready', () => {
             console.log('birthday check error', e.message),
         );
         checkBrief().catch((e) => console.log('brief error', e.message));
+        checkArticleIdeas().catch((e) =>
+            console.log('article ideas error', e.message),
+        );
     }, 10000);
     // Health check: if WhatsApp's page stops answering or is not connected for
     // 3 minutes in a row, exit so start-bot.bat restarts the bot.
