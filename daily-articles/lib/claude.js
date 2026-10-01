@@ -58,14 +58,14 @@ function makeAsk(cfg) {
     };
 }
 
-/** Pulls the first JSON value out of a model reply (tolerates ``` fences and chatter). */
+/** Pulls the first JSON value out of a model reply (tolerates a ```json wrapper and chatter around it). */
 function parseJsonLoose(text) {
-    const cleaned = text.replace(/```(?:json)?/gi, '').trim();
-    const start = cleaned.search(/[[{]/);
+    // Do not strip ``` characters: an article body inside the JSON contains code fences of its own.
+    const start = text.search(/[[{]/);
     if (start < 0) throw new Error('No JSON in the model reply');
-    const open = cleaned[start];
-    const end = cleaned.lastIndexOf(open === '[' ? ']' : '}');
-    return JSON.parse(cleaned.slice(start, end + 1));
+    const close = text[start] === '[' ? ']' : '}';
+    const end = text.lastIndexOf(close);
+    return JSON.parse(text.slice(start, end + 1));
 }
 
 /** Calls the model and parses JSON, retrying once if the reply is not valid JSON. */

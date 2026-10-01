@@ -8,10 +8,27 @@ fact-checking editor**, and publishes it to **dev.to**. It needs no input from y
 
 1. Skips if you already published an article today (so running twice never double-posts).
 2. Picks the area of the day (rotates AI → Python → Cloud → Machine Learning).
-3. Claude writes one evergreen article (800-1100 words) that avoids your recent titles. Near-duplicate topics are rejected.
-4. A reviewer pass checks facts, API names, code, and invented statistics. Verdict: **approve**, **revise**
-   (the corrected text is used and re-checked once) or **reject**.
-5. Publishes according to `PUBLISH_MODE`.
+3. **Gathers fresh material** for that area so the article can cover what is current: recent library releases
+   (GitHub release feeds, PyPI), cloud announcements (AWS What's New, Google Cloud release notes) and the hottest new
+   developer questions (Stack Overflow). Public sources, no accounts. A source that fails is skipped.
+4. Claude writes **one practical problem-solving article**: a configuration guide, a programming technique, or the diagnosis
+   and fix of a specific error, grounded in that material. Near-duplicate topics are rejected.
+5. **Automatic quality checks** (below), with one automatic repair if something is wrong.
+6. A second Claude pass **reviews it as a fact-checking editor against the same sources**: approve, revise (the corrected
+   text is re-checked once) or reject.
+7. Publishes according to `PUBLISH_MODE`. In `live` mode an article goes public **only if the quality checks and the
+   review both pass**; otherwise it is saved as a draft for you.
+
+## Formatting and quality checks
+
+Every article must pass these before it can go live:
+
+- Sections in a fixed order: TL;DR, The problem, Environment, Solution (numbered steps), Why this works, Common pitfalls,
+  Summary, Sources. No H1 in the body, 700-1800 words.
+- Every code block is fenced and names its language; code fences are balanced.
+- **Links only from the sources it was given** (anything else is blocked, which also stops text injected into a source from
+  planting links), and at least one source must be cited.
+- No risky commands (download-and-run scripts, `chmod 777`, recursive deletes, disabling TLS verification).
 
 ## Safety settings (please read)
 
@@ -21,8 +38,9 @@ fact-checking editor**, and publishes it to **dev.to**. It needs no input from y
 | `live`            | Publishes only if the review **approved**; otherwise saves a draft.         |
 | `dry`             | Prints the article, publishes nothing, needs no dev.to key.                 |
 
-- **Start in `draft` mode** for the first week or two and read the drafts at dev.to/dashboard. Switch to `live` once
-  you trust the quality.
+- **Start in `draft` mode** for the first week or two and read the drafts at dev.to/dashboard. When you trust the
+  quality, switch on unattended publishing by setting `PUBLISH_MODE=live` (in `.env`, or the `PUBLISH_MODE` variable in
+  GitHub). Nothing else needs to change.
 - **Every article ends with an AI-assistance disclosure line.** You can change its wording (`ARTICLE_DISCLOSURE`) but it
   cannot be turned off. dev.to's rules expect AI-assisted posts to be disclosed and to add real value; low-effort or
   spammy automated posting can get an account restricted.
@@ -63,5 +81,11 @@ double post. Logs of each run are appended to `published-log.jsonl`.
 
 ## Options
 
-`AREAS` (comma list, default `AI,Python,Cloud,Machine Learning`), `ARTICLE_MODEL` (default `claude-opus-5-5`),
+`AREAS` (comma list, default `AI,Python,Cloud,Machine Learning`; the sources are defined in `lib/sources.js`), `ARTICLE_MODEL` (default `claude-opus-5-5`),
 `ARTICLE_DISCLOSURE`. Keys can also be real environment variables instead of `.env`.
+
+## Notes on "latest"
+
+The article is only as current as the sources it was handed that day, and it may only state recent facts that appear in
+them. If no source can be fetched, it writes an evergreen troubleshooting article and does not claim anything is new.
+Stack Overflow's free API allows about 300 requests per day per address, which is plenty for one run.
